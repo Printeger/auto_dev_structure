@@ -1,0 +1,18 @@
+{
+  "$schema": "./STATE.schema.json",
+  "schema_version": 1,
+  "project_name": "{{PROJECT_NAME}}",
+  "project_status": "BOOTSTRAP",
+  "quality_mode": "BUILD",
+  "phase": "IDLE",
+  "last_outcome": null,
+  "current_milestone": null,
+  "current_task_id": null,
+  "last_good_commit": null,
+  "agent_calls": 0,
+  "rework_count": 0,
+  "blocker": null,
+  "next_action": "Complete the required project contracts, then activate the project.",
+  "next_owner": "HUMAN",
+  "updated_at": "2026-01-01T00:00:00Z"
+}

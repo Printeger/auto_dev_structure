@@ -1,0 +1,17 @@
+{
+  "description": "Optional one-shot project-state validation when a Codex turn stops. Copy to hooks.json and trust explicitly with /hooks.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/scripts/hooks/stop_validate.py\"",
+            "timeout": 30,
+            "statusMessage": "Validating AutoDev state"
+          }
+        ]
+      }
+    ]
+  }
+}

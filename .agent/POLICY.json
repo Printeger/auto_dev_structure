@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "limits": {
+    "max_agent_calls_per_task": 4,
+    "max_reworks_per_task": 2
+  },
+  "defaults": {
+    "quality_mode": "BUILD",
+    "risk": "MEDIUM"
+  },
+  "risk_levels": ["LOW", "MEDIUM", "HIGH"],
+  "review_required_when": [
+    "risk=HIGH",
+    "architecture_change",
+    "shared_data_structure_change",
+    "milestone_integration",
+    "quality_mode=HARDENING"
+  ],
+  "human_escalation_when": [
+    "missing_product_decision",
+    "external_authority_or_credential_required",
+    "persistent_environment_failure",
+    "irreconcilable_contract_conflict",
+    "agent_or_rework_budget_exhausted"
+  ]
+}

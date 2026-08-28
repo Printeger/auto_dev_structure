@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "STATE.schema.json",
+  "title": "AutoDev persistent project state",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schema_version",
+    "project_name",
+    "project_status",
+    "quality_mode",
+    "phase",
+    "last_outcome",
+    "current_milestone",
+    "current_task_id",
+    "last_good_commit",
+    "agent_calls",
+    "rework_count",
+    "blocker",
+    "next_action",
+    "next_owner",
+    "updated_at"
+  ],
+  "properties": {
+    "$schema": {"type": "string", "const": "./STATE.schema.json"},
+    "schema_version": {"type": "integer", "const": 1},
+    "project_name": {"type": "string", "minLength": 1},
+    "project_status": {"type": "string", "enum": ["BOOTSTRAP", "ACTIVE", "BLOCKED", "COMPLETE"]},
+    "quality_mode": {"type": "string", "enum": ["BUILD", "INTEGRATION", "HARDENING"]},
+    "phase": {"type": "string", "enum": ["IDLE", "DISCOVER", "DESIGN", "IMPLEMENT", "TEST", "REVIEW", "INTEGRATE", "CHECKPOINT"]},
+    "last_outcome": {"type": ["string", "null"], "enum": [null, "PASS", "PASS_WITH_DEBT", "REWORK", "BLOCKED"]},
+    "current_milestone": {"type": ["string", "null"]},
+    "current_task_id": {"type": ["string", "null"], "pattern": "^TASK-[0-9]{3,}$"},
+    "last_good_commit": {"type": ["string", "null"], "pattern": "^[0-9a-fA-F]{7,64}$"},
+    "agent_calls": {"type": "integer", "minimum": 0},
+    "rework_count": {"type": "integer", "minimum": 0},
+    "blocker": {"type": ["string", "null"]},
+    "next_action": {"type": ["string", "null"]},
+    "next_owner": {"type": "string", "enum": ["COMMANDER", "EXPLORER", "BUILDER", "REVIEWER", "HUMAN", "NONE"]},
+    "updated_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}
