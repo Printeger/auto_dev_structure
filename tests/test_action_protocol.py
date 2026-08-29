@@ -233,12 +233,23 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertEqual(state["tasks"]["TASK-001"]["status"], "REVIEWING")
         self.assertIsNone(state["current_action_id"])
 
-        recovered = ActionController(self.root).get_next_action(campaign_id)
+        result = self.passing_result(worker)
+        conflicting = dict(result, summary="conflicting duplicate")
+        before_conflict = self.snapshot()
+        conflict = ActionController(self.root).submit_action_result(worker["id"], conflicting)
+        self.assertEqual(conflict.status, "INVALID", conflict)
+        self.assertEqual(self.snapshot(), before_conflict)
+
+        recovered = ActionController(self.root).submit_action_result(worker["id"], result)
         repeated = ActionController(self.root).get_next_action(campaign_id)
 
         self.assertEqual(recovered.status, "SUCCESS", recovered)
         self.assertEqual(recovered.action["type"], "RUN_IMMEDIATE_REVIEW")
         self.assertEqual(recovered.action, repeated.action)
+        attempt = json.loads(
+            (self.root / f".autodev/runs/{worker['context']['run_id']}/action-attempt.json").read_text()
+        )
+        self.assertEqual(recovered.action["id"], attempt["review_action_id"])
         self.assertEqual(len(list((self.root / ".autodev/actions").glob("*/action.json"))), 2)
 
     def test_retry_reconciles_ref_advanced_before_canonical_checkpoint(self) -> None:
@@ -815,6 +826,81 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertIn("source changed concurrently", concurrent.message)
         self.assertEqual(self.snapshot(), before_concurrent)
 
+    def test_path_rejection_retry_converges_between_run_finish_and_action_resolve(self) -> None:
+        campaign_id = self.approve()
+        controller = ActionController(self.root)
+        action = dict(controller.get_next_action(campaign_id).action or {})
+        Path(action["workspace"]).joinpath("outside.txt").write_text("not allowed\n", encoding="utf-8")
+        result = self.passing_result(action)
+        from autodev import control_plane
+
+        original = control_plane._atomic_replace_json
+        failed_once = False
+
+        def fail_path_resolve(path: Path, value: object) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once and path.name == "state.json" and isinstance(value, dict)
+                and value.get("current_action_id") is None
+                and value.get("tasks", {}).get("TASK-001", {}).get("status") == "READY"
+            ):
+                failed_once = True
+                raise OSError("injected path rejection resolve fault")
+            original(path, value)
+
+        with mock.patch.object(control_plane, "_atomic_replace_json", side_effect=fail_path_resolve):
+            interrupted = controller.submit_action_result(action["id"], result)
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        self.assertTrue(Path(action["workspace"]).exists())
+        conflicting = dict(result, summary="conflicting duplicate")
+        before = self.snapshot()
+        self.assertEqual(
+            ActionController(self.root).submit_action_result(action["id"], conflicting).status,
+            "INVALID",
+        )
+        self.assertEqual(self.snapshot(), before)
+
+        recovered = ActionController(self.root).submit_action_result(action["id"], result)
+
+        self.assertEqual(recovered.status, "NOT_READY", recovered)
+        self.assertIn("outside-allowed", recovered.message)
+        self.assertFalse(Path(action["workspace"]).exists())
+
+    def test_path_rejection_retry_converges_after_resolve_before_cleanup(self) -> None:
+        campaign_id = self.approve()
+        controller = ActionController(self.root)
+        action = dict(controller.get_next_action(campaign_id).action or {})
+        Path(action["workspace"]).joinpath("outside.txt").write_text("not allowed\n", encoding="utf-8")
+        result = self.passing_result(action)
+        original_cleanup = CampaignWorkspace.remove_task_workspace
+        failed_once = False
+
+        def fail_path_cleanup(owner: CampaignWorkspace, workspace: Path) -> None:
+            nonlocal failed_once
+            intent = json.loads(
+                (self.root / f".autodev/actions/{action['id']}/finalization.json").read_text()
+            )
+            if (
+                not failed_once and workspace.resolve() == Path(action["workspace"]).resolve()
+                and intent["phase"] == "PROGRESSED"
+            ):
+                failed_once = True
+                raise CampaignWorkspaceError("injected path rejection cleanup fault")
+            original_cleanup(owner, workspace)
+
+        with mock.patch.object(
+            CampaignWorkspace, "remove_task_workspace", autospec=True,
+            side_effect=fail_path_cleanup,
+        ):
+            interrupted = controller.submit_action_result(action["id"], result)
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        self.assertTrue(Path(action["workspace"]).exists())
+
+        recovered = ActionController(self.root).submit_action_result(action["id"], result)
+
+        self.assertEqual(recovered.status, "NOT_READY", recovered)
+        self.assertFalse(Path(action["workspace"]).exists())
+
     def test_worker_rework_and_blocked_results_are_overridden_by_actual_path_policy(self) -> None:
         campaign_id = self.approve()
         controller = ActionController(self.root)
@@ -1388,6 +1474,129 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertEqual(repaired.action["type"], "EXECUTE_TASK")
         diagnostics = list((self.root / ".autodev/runs").glob("*/diagnostic.json"))
         self.assertEqual(len(diagnostics), 1)
+
+    def test_validation_failure_retry_converges_between_run_finish_and_action_resolve(self) -> None:
+        campaign_id = self.approve()
+        controller = ActionController(self.root)
+        action = dict(controller.get_next_action(campaign_id).action or {})
+        Path(action["workspace"]).joinpath("app.py").write_text("VALUE = 3\n", encoding="utf-8")
+        result = self.passing_result(action)
+        from autodev import control_plane
+
+        original = control_plane._atomic_replace_json
+        failed_once = False
+
+        def fail_validation_resolve(path: Path, value: object) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once and path.name == "state.json" and isinstance(value, dict)
+                and value.get("current_action_id") is None
+                and value.get("tasks", {}).get("TASK-001", {}).get("status") == "READY"
+            ):
+                failed_once = True
+                raise OSError("injected validation failure resolve fault")
+            original(path, value)
+
+        with mock.patch.object(
+            control_plane, "_atomic_replace_json", side_effect=fail_validation_resolve,
+        ):
+            interrupted = controller.submit_action_result(action["id"], result)
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        self.assertTrue(Path(action["workspace"]).exists())
+        conflicting = dict(result, summary="conflicting duplicate")
+        before = self.snapshot()
+        self.assertEqual(
+            ActionController(self.root).submit_action_result(action["id"], conflicting).status,
+            "INVALID",
+        )
+        self.assertEqual(self.snapshot(), before)
+
+        recovered = ActionController(self.root).submit_action_result(action["id"], result)
+
+        self.assertEqual(recovered.status, "NOT_READY", recovered)
+        self.assertEqual(recovered.data["validations"][0]["returncode"], 1)
+        self.assertFalse(Path(action["workspace"]).exists())
+
+    def test_validation_failure_retry_converges_after_resolve_before_cleanup(self) -> None:
+        campaign_id = self.approve()
+        controller = ActionController(self.root)
+        action = dict(controller.get_next_action(campaign_id).action or {})
+        Path(action["workspace"]).joinpath("app.py").write_text("VALUE = 3\n", encoding="utf-8")
+        result = self.passing_result(action)
+        original_cleanup = CampaignWorkspace.remove_task_workspace
+        failed_once = False
+
+        def fail_validation_cleanup(owner: CampaignWorkspace, workspace: Path) -> None:
+            nonlocal failed_once
+            intent = json.loads(
+                (self.root / f".autodev/actions/{action['id']}/finalization.json").read_text()
+            )
+            if (
+                not failed_once and workspace.resolve() == Path(action["workspace"]).resolve()
+                and intent["phase"] == "PROGRESSED"
+            ):
+                failed_once = True
+                raise CampaignWorkspaceError("injected validation cleanup fault")
+            original_cleanup(owner, workspace)
+
+        with mock.patch.object(
+            CampaignWorkspace, "remove_task_workspace", autospec=True,
+            side_effect=fail_validation_cleanup,
+        ):
+            interrupted = controller.submit_action_result(action["id"], result)
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        self.assertTrue(Path(action["workspace"]).exists())
+
+        recovered = ActionController(self.root).submit_action_result(action["id"], result)
+
+        self.assertEqual(recovered.status, "NOT_READY", recovered)
+        self.assertFalse(Path(action["workspace"]).exists())
+
+    def test_validation_retry_republishes_same_diagnostic_from_identical_submit(self) -> None:
+        campaign_id = self.approve()
+        controller = ActionController(self.root)
+        first = dict(controller.get_next_action(campaign_id).action or {})
+        Path(first["workspace"]).joinpath("app.py").write_text("VALUE = 3\n", encoding="utf-8")
+        self.assertEqual(
+            controller.submit_action_result(first["id"], self.passing_result(first)).status,
+            "NOT_READY",
+        )
+        second = dict(controller.get_next_action(campaign_id).action or {})
+        Path(second["workspace"]).joinpath("app.py").write_text("VALUE = 3\n", encoding="utf-8")
+        result = self.passing_result(second)
+        from autodev import control_plane
+
+        original = control_plane._atomic_replace_json
+        failed_once = False
+
+        def fail_diagnostic_publication(path: Path, value: object) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once and path.name == "state.json" and isinstance(value, dict)
+                and value.get("current_action_id") is not None
+                and value.get("current_action_id") != second["id"]
+                and value.get("tasks", {}).get("TASK-001", {}).get("status") == "READY"
+            ):
+                failed_once = True
+                raise OSError("injected Diagnostic publication fault")
+            original(path, value)
+
+        with mock.patch.object(
+            control_plane, "_atomic_replace_json", side_effect=fail_diagnostic_publication,
+        ):
+            interrupted = controller.submit_action_result(second["id"], result)
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        failure = json.loads(
+            (self.root / f".autodev/runs/{second['context']['run_id']}/failure.json").read_text()
+        )
+
+        recovered = ActionController(self.root).submit_action_result(second["id"], result)
+        repeated = ActionController(self.root).get_next_action(campaign_id)
+
+        self.assertEqual(recovered.status, "SUCCESS", recovered)
+        self.assertEqual(recovered.action["type"], "RUN_DIAGNOSTIC")
+        self.assertEqual(recovered.action["id"], failure["diagnostic_action_id"])
+        self.assertEqual(recovered.action, repeated.action)
 
     def test_repeated_failure_obeys_the_shared_quality_router_decision(self) -> None:
         campaign_id = self.approve()

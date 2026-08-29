@@ -736,58 +736,94 @@ class ActionController:
                 action, result, patch, changed_paths, validations,
             )
         if action["quality_route"] == "IMMEDIATE":
-            reviewing = self._control.execute(Command(
-                "run.phase", {"run_id": run_id, "to": "REVIEWING"},
-            ))
-            if reviewing.status != "SUCCESS":
-                return ActionOutcome(reviewing.status, reviewing.message, data=reviewing.data)
-            attempt = {
+            return self._handoff_immediate_review(
+                action, result, patch, changed_paths, validations,
+            )
+        return self._accept_changes(action, result, patch, changed_paths, validations)
+
+    def _handoff_immediate_review(
+        self, action: dict[str, Any], result: dict[str, Any], patch: bytes,
+        changed_paths: list[str], validations: list[dict[str, Any]],
+    ) -> ActionOutcome:
+        run_id = str(action["context"]["run_id"])
+        attempt_path = self._canonical / "runs" / run_id / "action-attempt.json"
+        try:
+            intent = self._prepare_finalization(action, result, "IMMEDIATE_HANDOFF")
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INVALID", str(error))
+        if intent["phase"] == "PREPARED":
+            state = self._read_state()
+            task_status = state.get("tasks", {}).get(action["task_id"], {}).get("status")
+            if task_status == "VALIDATING":
+                reviewing = self._control.execute(Command(
+                    "run.phase", {"run_id": run_id, "to": "REVIEWING"},
+                ))
+                if reviewing.status != "SUCCESS":
+                    return ActionOutcome(reviewing.status, reviewing.message, data=reviewing.data)
+            elif task_status != "REVIEWING":
+                return ActionOutcome("INFRA_FAILURE", f"cannot reconcile Review handoff from {task_status}")
+            expected = {
                 "worker_action_id": action["id"], "worker_result": result,
                 "review_action_id": f"ACTION-{uuid.uuid4().hex}",
                 "patch_hash": _hash(patch), "changed_paths": changed_paths,
                 "validations": validations,
             }
-            _write_json_atomic(
-                self._canonical / "runs" / run_id / "action-attempt.json", attempt,
-            )
-            provisional = ActionOutcome("SUCCESS", f"Action {action['id']} accepted")
-            resolved = self._resolve(action, result, provisional)
-            if resolved.status != "SUCCESS":
-                return resolved
-            review = self._create_immediate_review(action, workspace, attempt)
-            _write_json_atomic(
-                self._canonical / "actions" / action["id"] / "outcome.json",
-                self._outcome_dict(review),
-            )
-            return review
-        return self._accept_changes(action, result, patch, changed_paths, validations)
+            if attempt_path.is_file():
+                try:
+                    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as error:
+                    return ActionOutcome("INFRA_FAILURE", f"Review handoff is invalid: {error}")
+                durable_fields = (
+                    "worker_action_id", "worker_result", "patch_hash", "changed_paths",
+                )
+                if (
+                    not isinstance(attempt.get("review_action_id"), str)
+                    or any(attempt.get(field) != expected[field] for field in durable_fields)
+                    or not isinstance(attempt.get("validations"), list)
+                ):
+                    return ActionOutcome("INVALID", "Review handoff conflicts with durable attempt")
+            else:
+                attempt = expected
+                _write_json_atomic(attempt_path, attempt)
+            intent = self._mark_finalization(action, intent, "OPERATED")
+        try:
+            attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            return ActionOutcome("INFRA_FAILURE", f"Review handoff cannot be recovered: {error}")
+        provisional = ActionOutcome("SUCCESS", f"Action {action['id']} accepted")
+        return self._complete_finalization(
+            action, result, intent, provisional,
+            lambda: self._create_immediate_review(action, Path(action["workspace"]), attempt),
+            cleanup_workspace=False,
+        )
 
     def _reject_worker_attempt(
         self, action: dict[str, Any], submitted_result: dict[str, Any], message: str,
     ) -> ActionOutcome:
         """Resolve a valid submission rejected by a Core-derived trust gate."""
 
-        run_id = str(action["context"]["run_id"])
+        try:
+            intent = self._prepare_finalization(action, submitted_result, "TRUST_REJECTION")
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INVALID", str(error))
+        if "message" in intent:
+            message = str(intent["message"])
+        else:
+            intent = dict(intent, message=message)
+            _write_json_atomic(self._finalization_path(action), intent)
         evidence_result = {
             **submitted_result, "outcome": "REWORK", "summary": message,
             "blocker": None, "next_action": None,
         }
-        evidence_id = self._write_evidence(
-            action, evidence_result, b"", [], [], None,
-            action_result=submitted_result,
-        )
-        finished = self._attempts.finish(
-            run_id=run_id, outcome="REWORK", evidence_id=evidence_id,
-        )
-        if finished.status != "SUCCESS":
-            return ActionOutcome(finished.status, finished.message, data=finished.data)
-        resolved = self._resolve(
-            action, submitted_result, ActionOutcome("NOT_READY", message),
-        )
-        if resolved.status != "NOT_READY":
-            return resolved
-        cleanup = self._safe_cleanup(str(action["campaign_id"]), Path(action["workspace"]))
-        return cleanup or resolved
+        if intent["phase"] == "PREPARED":
+            operated = self._finish_rework_operation(
+                action, submitted_result, evidence_result, b"", [], [],
+            )
+            if operated is not None:
+                return operated
+            intent = self._mark_finalization(action, intent, "OPERATED")
+        final = ActionOutcome("NOT_READY", message)
+        return self._complete_finalization(action, submitted_result, intent, final, lambda: final)
 
     def _resolve_validation_failure(
         self, action: dict[str, Any], result: dict[str, Any], patch: bytes,
@@ -801,27 +837,66 @@ class ActionController:
                 for item in validations if item["returncode"] != 0
             ],
         })
+        failure_path = self._canonical / "runs" / run_id / "failure.json"
+        try:
+            intent = self._prepare_finalization(action, result, "VALIDATION_FAILURE")
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INVALID", str(error))
         failure = {
             "action_id": action["id"], "task_id": action["task_id"],
             "fingerprint": fingerprint, "validations": validations,
             "diff_hash": _hash(patch), "changed_paths": changed_paths,
+            "diagnostic_action_id": f"ACTION-{uuid.uuid4().hex}",
         }
-        _write_json_atomic(self._canonical / "runs" / run_id / "failure.json", failure)
-        evidence_result = {**result, "outcome": "REWORK"}
-        evidence_id = self._write_evidence(
-            action, evidence_result, patch, changed_paths, validations, None,
+        if failure_path.is_file():
+            try:
+                failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as error:
+                return ActionOutcome("INFRA_FAILURE", f"validation failure is invalid: {error}")
+            if (
+                failure.get("action_id") != action["id"]
+                or failure.get("task_id") != action["task_id"]
+                or failure.get("diff_hash") != _hash(patch)
+                or failure.get("fingerprint") != fingerprint
+            ):
+                return ActionOutcome("INVALID", "validation failure conflicts with durable attempt")
+        elif intent["phase"] == "PREPARED":
+            _write_json_atomic(failure_path, failure)
+        if intent["phase"] == "PREPARED":
+            evidence_result = {**result, "outcome": "REWORK"}
+            operated = self._finish_rework_operation(
+                action, result, evidence_result, patch, changed_paths, validations,
+            )
+            if operated is not None:
+                return operated
+            intent = self._mark_finalization(action, intent, "OPERATED")
+        return self._finish_validation_finalization(action, result, intent, failure)
+
+    def _finish_validation_finalization(
+        self, action: dict[str, Any], result: dict[str, Any], intent: dict[str, Any],
+        failure: Mapping[str, Any],
+    ) -> ActionOutcome:
+        validations = list(failure["validations"])
+        provisional = ActionOutcome(
+            "NOT_READY", "Core validation requires focused rework",
+            data={"validations": validations},
         )
-        finished = self._attempts.finish(
-            run_id=run_id, outcome="REWORK", evidence_id=evidence_id,
+        route = self._validation_failure_route(action)
+
+        def progress() -> ActionOutcome:
+            if route == QualityDecision.DIAGNOSTIC:
+                return self._create_diagnostic(
+                    action, Path(action["workspace"]), failure,
+                    action_id=str(failure["diagnostic_action_id"]),
+                )
+            return provisional
+
+        return self._complete_finalization(
+            action, result, intent, provisional, progress,
+            cleanup_workspace=route != QualityDecision.DIAGNOSTIC,
         )
-        if finished.status != "SUCCESS":
-            return ActionOutcome(finished.status, finished.message, data=finished.data)
-        resolved = self._resolve(
-            action, result,
-            ActionOutcome("NOT_READY", "Core validation requires focused rework", data={"validations": validations}),
-        )
-        if resolved.status not in {"SUCCESS", "NOT_READY"}:
-            return resolved
+
+    def _validation_failure_route(self, action: Mapping[str, Any]) -> QualityDecision:
         same_failures = []
         diagnostic_used = False
         for path in sorted((self._canonical / "runs").glob("*/failure.json")):
@@ -832,34 +907,39 @@ class ActionController:
             if item.get("task_id") == action["task_id"]:
                 same_failures.append(item.get("fingerprint"))
                 diagnostic_used = diagnostic_used or path.with_name("diagnostic.json").is_file()
-        route = self._attempts.decide_quality(
+        return self._attempts.decide_quality(
             self._contract_for(action), failure_fingerprints=same_failures,
             diagnostic_used=diagnostic_used,
         )
-        if route == QualityDecision.DIAGNOSTIC:
-            final = self._create_diagnostic(action, Path(action["workspace"]), failure)
-            _write_json_atomic(
-                self._canonical / "actions" / action["id"] / "outcome.json",
-                self._outcome_dict(final),
-            )
-            return final
-        cleanup = self._safe_cleanup(str(action["campaign_id"]), Path(action["workspace"]))
-        return cleanup or resolved
 
     def _create_diagnostic(
         self, worker: Mapping[str, Any], workspace: Path, failure: Mapping[str, Any],
+        *, action_id: str | None = None,
     ) -> ActionOutcome:
-        action = self._action_record(
-            action_id=f"ACTION-{uuid.uuid4().hex}", action_type="RUN_DIAGNOSTIC",
-            campaign_id=str(worker["campaign_id"]), phase=worker["phase"],
-            task_id=str(worker["task_id"]), role="diagnostic", quality_route="DIAGNOSTIC",
-            workspace=workspace,
-            context={
-                "run_id": worker["context"]["run_id"],
-                "source_fingerprint": worker["context"]["source_fingerprint"],
-                "failure_ref": f"runs/{worker['context']['run_id']}/failure.json",
-            },
-        )
+        action_id = action_id or f"ACTION-{uuid.uuid4().hex}"
+        action_path = self._canonical / "actions" / action_id / "action.json"
+        if action_path.is_file():
+            try:
+                action = json.loads(action_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as error:
+                return ActionOutcome("INFRA_FAILURE", f"orphan Diagnostic Action is invalid: {error}")
+        else:
+            action = self._action_record(
+                action_id=action_id, action_type="RUN_DIAGNOSTIC",
+                campaign_id=str(worker["campaign_id"]), phase=worker["phase"],
+                task_id=str(worker["task_id"]), role="diagnostic", quality_route="DIAGNOSTIC",
+                workspace=workspace,
+                context={
+                    "run_id": worker["context"]["run_id"],
+                    "source_fingerprint": worker["context"]["source_fingerprint"],
+                    "failure_ref": f"runs/{worker['context']['run_id']}/failure.json",
+                },
+            )
+        state = self._read_state()
+        if state.get("current_action_id") == action_id:
+            return ActionOutcome("SUCCESS", f"Action {action_id} is pending", action)
+        if action.get("canonical_revision") != state.get("revision", -1) + 1:
+            return ActionOutcome("INFRA_FAILURE", "orphan Diagnostic Action revision cannot be reconciled")
         return self._persist_action(action)
 
     def _submit_diagnostic(
@@ -938,6 +1018,8 @@ class ActionController:
                 },
             )
         state = self._read_state()
+        if state.get("current_action_id") == action_id:
+            return ActionOutcome("SUCCESS", f"Action {action_id} is pending", action)
         if action.get("canonical_revision") != state.get("revision", -1) + 1:
             return ActionOutcome("INFRA_FAILURE", "orphan Reviewer Action revision cannot be reconciled")
         return self._persist_action(action)
@@ -1215,6 +1297,45 @@ class ActionController:
             return ActionOutcome("INFRA_FAILURE", f"workspace cleanup must be retried: {error}")
         return None
 
+    def _finish_rework_operation(
+        self, action: Mapping[str, Any], submitted_result: Mapping[str, Any],
+        evidence_result: Mapping[str, Any], patch: bytes, changed_paths: list[str],
+        validations: list[dict[str, Any]],
+    ) -> ActionOutcome | None:
+        """Durably finish a Core-derived REWORK operation before Action resolution."""
+
+        run_id = str(action["context"]["run_id"])
+        state = self._read_state()
+        if state.get("current_run_id") == run_id:
+            evidence_id = self._write_evidence(
+                action, evidence_result, patch, changed_paths, validations, None,
+                action_result=submitted_result,
+            )
+            finished = self._attempts.finish(
+                run_id=run_id, outcome="REWORK", evidence_id=evidence_id,
+            )
+            if finished.status != "SUCCESS":
+                return ActionOutcome(finished.status, finished.message, data=finished.data)
+            return None
+        try:
+            evidence = json.loads(
+                (self._canonical / "runs" / run_id / "evidence.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            return ActionOutcome("INFRA_FAILURE", f"REWORK evidence cannot be recovered: {error}")
+        task = state.get("tasks", {}).get(action.get("task_id"), {})
+        if (
+            evidence.get("action_id") != action["id"]
+            or evidence.get("action_result_hash", evidence.get("result_hash"))
+            != _hash(submitted_result)
+            or evidence.get("evidence_id") not in task.get("evidence_ids", [])
+            or state.get("last_outcome") != "REWORK"
+        ):
+            return ActionOutcome("INVALID", "REWORK result conflicts with canonical evidence")
+        return None
+
     def _finish_nonpassing(
         self, action: dict[str, Any], result: dict[str, Any],
         patch: bytes | None = None, changed_paths: list[str] | None = None,
@@ -1328,6 +1449,7 @@ class ActionController:
         self, action: Mapping[str, Any], result: Mapping[str, Any],
         intent: dict[str, Any], provisional: ActionOutcome,
         progress: Callable[[], ActionOutcome],
+        *, cleanup_workspace: bool = True,
     ) -> ActionOutcome:
         if intent["phase"] == "OPERATED":
             state = self._read_state()
@@ -1364,11 +1486,12 @@ class ActionController:
         else:
             final = self._outcome_from(intent["outcome"])
         if intent["phase"] == "PROGRESSED":
-            cleanup = self._safe_cleanup(
-                str(action["campaign_id"]), Path(str(action["workspace"])),
-            )
-            if cleanup is not None:
-                return cleanup
+            if cleanup_workspace:
+                cleanup = self._safe_cleanup(
+                    str(action["campaign_id"]), Path(str(action["workspace"])),
+                )
+                if cleanup is not None:
+                    return cleanup
             self._mark_finalization(action, intent, "COMMITTED", outcome=final)
         return final
 
@@ -1384,6 +1507,39 @@ class ActionController:
         intent = self._read_finalization(action) or {}
         if intent.get("kind") == "NONPASSING":
             return self._finish_nonpassing(action, result)
+        if intent.get("kind") == "IMMEDIATE_HANDOFF":
+            run_id = str(action["context"]["run_id"])
+            try:
+                attempt = json.loads(
+                    (self._canonical / "runs" / run_id / "action-attempt.json").read_text(
+                        encoding="utf-8",
+                    )
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                return ActionOutcome("INFRA_FAILURE", f"Review handoff cannot be recovered: {error}")
+            return self._complete_finalization(
+                action, result, intent,
+                ActionOutcome("SUCCESS", f"Action {action['id']} accepted"),
+                lambda: self._create_immediate_review(
+                    action, Path(action["workspace"]), attempt,
+                ),
+                cleanup_workspace=False,
+            )
+        if intent.get("kind") == "TRUST_REJECTION":
+            return self._reject_worker_attempt(
+                action, result, str(intent.get("message", "workspace policy rejected result")),
+            )
+        if intent.get("kind") == "VALIDATION_FAILURE":
+            run_id = str(action["context"]["run_id"])
+            try:
+                failure = json.loads(
+                    (self._canonical / "runs" / run_id / "failure.json").read_text(
+                        encoding="utf-8",
+                    )
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                return ActionOutcome("INFRA_FAILURE", f"validation failure cannot be recovered: {error}")
+            return self._finish_validation_finalization(action, result, intent, failure)
         if action["type"] in {"EXECUTE_TASK", "RUN_IMMEDIATE_REVIEW"}:
             return self._recover_accepted_action(action, result)
         return ActionOutcome("INFRA_FAILURE", "unknown Action finalization intent")
