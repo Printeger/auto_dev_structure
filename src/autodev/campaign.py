@@ -1012,6 +1012,9 @@ class CampaignController:
         if record["status"] != "TARGET_REACHED":
             return CampaignOutcome("NOT_READY", "only a reached Campaign can be materialized", campaign_id)
         if record["checkpoint"] == record["last_materialized_checkpoint"]:
+            finalized = self._finalize_materialization_request(campaign_id)
+            if finalized is not None:
+                return finalized
             return CampaignOutcome(
                 "SUCCESS", "Campaign checkpoint is already materialized", campaign_id,
                 {"campaign_id": campaign_id, "checkpoint": record["checkpoint"], "applied": False},
@@ -1073,26 +1076,88 @@ class CampaignController:
             "id": campaign_id, "checkpoint": materialized.to_commit,
         }))
         if result.status == "SUCCESS" and materialization_context is not None:
-            request_id = str(materialization_context["request_id"])
-            request_path = (
-                self.canonical / "campaigns" / campaign_id / "human-requests" / f"{request_id}.json"
-            )
-            request = json.loads(request_path.read_text(encoding="utf-8"))
-            if request.get("status") == "PENDING":
-                request.update(
-                    status="AUTO_RESOLVED", answers={"resolution": ["Retry Campaign"]},
-                    answered_at=_now(),
-                )
-                _write_json_atomic(request_path, request)
-            materialization_context.update(status="RESOLVED", resolved_at=_now())
-            _write_json_atomic(
-                self.canonical / "campaigns" / campaign_id / "blocker-context.json",
-                materialization_context,
-            )
+            finalized = self._finalize_materialization_request(campaign_id)
+            if finalized is not None:
+                return finalized
         return CampaignOutcome(result.status, result.message, campaign_id, {
             **dict(result.data), "patch_sha256": materialized.patch_sha256,
             "applied": materialized.applied,
         })
+
+    def _finalize_materialization_request(self, campaign_id: str) -> CampaignOutcome | None:
+        """Converge only the HumanRequest bound to a committed materialization retry."""
+
+        blocker_path = self.canonical / "campaigns" / campaign_id / "blocker-context.json"
+        if not blocker_path.is_file():
+            return None
+        try:
+            context = json.loads(blocker_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            return CampaignOutcome(
+                "INFRA_FAILURE", f"materialization blocker context is invalid: {error}", campaign_id,
+            )
+        if context.get("kind") != "materialization-conflict" or context.get("status") == "RESOLVED":
+            return None
+        if context.get("status") != "PENDING" or not isinstance(context.get("request_id"), str):
+            return CampaignOutcome("INFRA_FAILURE", "materialization blocker context is inconsistent", campaign_id)
+        state = self._state()
+        record = state.get("campaigns", {}).get(campaign_id, {})
+        if (
+            record.get("status") != "TARGET_REACHED"
+            or record.get("checkpoint") != record.get("last_materialized_checkpoint")
+            or state.get("project_status") == "BLOCKED"
+            or state.get("blocker") is not None
+        ):
+            return CampaignOutcome(
+                "NOT_READY", "materialization request cannot resolve before canonical commit",
+                campaign_id,
+            )
+        request_id = str(context["request_id"])
+        pending_id = state.get("current_action_id")
+        if pending_id is not None:
+            try:
+                pending = json.loads(
+                    (self.canonical / "actions" / str(pending_id) / "action.json").read_text(
+                        encoding="utf-8",
+                    )
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                return CampaignOutcome("INFRA_FAILURE", f"pending Action cannot be read: {error}", campaign_id)
+            if not (
+                pending.get("type") == "ASK_HUMAN"
+                and pending.get("campaign_id") == campaign_id
+                and pending.get("context", {}).get("request_id") == request_id
+            ):
+                return CampaignOutcome(
+                    "NOT_READY", "an unrelated Action remains pending after materialization", campaign_id,
+                )
+            reconciled = self._reconcile_terminal(campaign_id, "ASK_HUMAN")
+            if reconciled is not None:
+                return reconciled
+        request_path = (
+            self.canonical / "campaigns" / campaign_id / "human-requests" / f"{request_id}.json"
+        )
+        try:
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            return CampaignOutcome(
+                "INFRA_FAILURE", f"materialization HumanRequest cannot be read: {error}", campaign_id,
+            )
+        if request.get("campaign_id") != campaign_id or request.get("request_id") != request_id:
+            return CampaignOutcome("INFRA_FAILURE", "materialization HumanRequest identity mismatch", campaign_id)
+        if request.get("status") == "PENDING":
+            request.update(
+                status="AUTO_RESOLVED", answers={"resolution": ["Retry Campaign"]},
+                answered_at=_now(),
+            )
+            _write_json_atomic(request_path, request)
+        elif request.get("status") != "AUTO_RESOLVED":
+            return CampaignOutcome(
+                "INFRA_FAILURE", "materialization HumanRequest has an incompatible status", campaign_id,
+            )
+        context.update(status="RESOLVED", resolved_at=context.get("resolved_at") or _now())
+        _write_json_atomic(blocker_path, context)
+        return None
 
     def archive(self, campaign_id: str) -> CampaignOutcome:
         reconciled = self._reconcile_terminal(campaign_id, "ASK_HUMAN", "TARGET_REACHED")

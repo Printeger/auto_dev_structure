@@ -406,6 +406,68 @@ class CampaignControllerTests(unittest.TestCase):
         self.assertEqual(state["current_action_id"], before_id)
         self.assertEqual(ActionController(self.root).get_next_action("CAMP-001").action, asking.action)
 
+    def test_materialize_retry_finishes_request_after_canonical_commit_crash(self) -> None:
+        only_task = task()
+        only_task["validation_commands"] = [
+            {"argv": ["python3", "-c", "pass"], "cwd": ".", "timeout": 10},
+        ]
+        controller = CampaignController(self.root, FakePlanner([proposal([only_task])]))
+        planned = controller.plan(CampaignRequest("Build", target="ARCHITECTURE_BASELINE"))
+        self.assertEqual(controller.approve("CAMP-001", planned.data["proposal_hash"]).status, "SUCCESS")
+        passed = EngineResult("SUCCESS", {
+            "outcome": "PASS", "summary": "done", "blocker": None,
+            "next_action": None, "findings": [], "debt_items": [],
+        })
+        self.assertEqual(RunController(
+            self.root, FakeCodexRunner([passed], [{"app.py": "VALUE = 2\n"}]),
+        ).run(RunRequest()).status, "SUCCESS")
+        (self.root / "user.txt").write_text("concurrent\n", encoding="utf-8")
+        self.assertEqual(controller.phase_gate("CAMP-001").status, "BLOCKED")
+        asking = ActionController(self.root).get_next_action("CAMP-001")
+        request_id = asking.action["context"]["request_id"]
+        request_path = (
+            self.root / f".autodev/campaigns/CAMP-001/human-requests/{request_id}.json"
+        )
+        (self.root / "user.txt").unlink()
+        from autodev import campaign
+        original = campaign._write_json_atomic
+        failed_once = False
+
+        def fail_request_resolution(path: Path, value: object) -> None:
+            nonlocal failed_once
+            state = json.loads((self.root / ".autodev/state.json").read_text())
+            record = state["campaigns"]["CAMP-001"]
+            if (
+                not failed_once and path == request_path
+                and record["checkpoint"] == record["last_materialized_checkpoint"]
+            ):
+                failed_once = True
+                raise OSError("injected post-canonical request resolution fault")
+            original(path, value)
+
+        with mock.patch.object(campaign, "_write_json_atomic", side_effect=fail_request_resolution):
+            with self.assertRaisesRegex(OSError, "post-canonical"):
+                controller.materialize("CAMP-001")
+
+        committed = json.loads((self.root / ".autodev/state.json").read_text())
+        self.assertEqual(
+            committed["campaigns"]["CAMP-001"]["checkpoint"],
+            committed["campaigns"]["CAMP-001"]["last_materialized_checkpoint"],
+        )
+        self.assertIsNone(committed["current_action_id"])
+        self.assertEqual(json.loads(request_path.read_text())["status"], "PENDING")
+        revision = committed["revision"]
+
+        recovered = controller.materialize("CAMP-001")
+
+        self.assertEqual(recovered.status, "SUCCESS", recovered)
+        self.assertEqual(json.loads(request_path.read_text())["status"], "AUTO_RESOLVED")
+        context = json.loads(
+            (self.root / ".autodev/campaigns/CAMP-001/blocker-context.json").read_text()
+        )
+        self.assertEqual(context["status"], "RESOLVED")
+        self.assertEqual(json.loads((self.root / ".autodev/state.json").read_text())["revision"], revision)
+
     def test_archive_refuses_active_campaign_without_deleting_private_ref(self) -> None:
         controller = CampaignController(self.root, FakePlanner([proposal([task()])]))
         planned = controller.plan(CampaignRequest("Build", target="ARCHITECTURE_BASELINE"))

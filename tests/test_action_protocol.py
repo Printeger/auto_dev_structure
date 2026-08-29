@@ -77,6 +77,18 @@ def proposal(tasks: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def planner_question() -> dict[str, object]:
+    return {
+        "id": "approach", "header": "Approach",
+        "question": "Which implementation should be used?",
+        "options": [
+            {"label": "Simple", "description": "Use the smallest implementation."},
+            {"label": "Layered", "description": "Add an abstraction layer."},
+        ],
+        "isOther": False, "isSecret": False,
+    }
+
+
 class ActionProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -288,7 +300,15 @@ class ActionProtocolTests(unittest.TestCase):
         def fail_accepted_cleanup(owner: CampaignWorkspace, workspace: Path) -> None:
             nonlocal failed_once
             state = json.loads((self.root / ".autodev/state.json").read_text())
-            if not failed_once and state["tasks"]["TASK-001"]["status"] == "ACCEPTED":
+            finalization = json.loads(
+                (self.root / f".autodev/actions/{action['id']}/finalization.json").read_text()
+            )
+            if (
+                not failed_once
+                and workspace.resolve() == Path(action["workspace"]).resolve()
+                and state["tasks"]["TASK-001"]["status"] == "ACCEPTED"
+                and finalization["phase"] == "PROGRESSED"
+            ):
                 failed_once = True
                 raise CampaignWorkspaceError("injected accepted cleanup fault")
             original_cleanup(owner, workspace)
@@ -302,7 +322,7 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
         accepted = json.loads((self.root / ".autodev/state.json").read_text())
         self.assertEqual(accepted["tasks"]["TASK-001"]["status"], "ACCEPTED")
-        self.assertEqual(accepted["current_action_id"], action["id"])
+        self.assertNotEqual(accepted["current_action_id"], action["id"])
 
         recovered = ActionController(self.root).submit_action_result(action["id"], result)
 
@@ -362,8 +382,9 @@ class ActionProtocolTests(unittest.TestCase):
             state = json.loads((self.root / ".autodev/state.json").read_text())
             if (
                 not failed_once
+                and workspace.resolve() == Path(review["workspace"]).resolve()
                 and state["tasks"]["TASK-001"]["status"] == "ACCEPTED"
-                and state["current_action_id"] == review["id"]
+                and state["current_action_id"] != review["id"]
             ):
                 failed_once = True
                 raise CampaignWorkspaceError("injected accepted Reviewer cleanup fault")
@@ -378,7 +399,7 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
         accepted = json.loads((self.root / ".autodev/state.json").read_text())
         self.assertEqual(accepted["tasks"]["TASK-001"]["status"], "ACCEPTED")
-        self.assertEqual(accepted["current_action_id"], review["id"])
+        self.assertNotEqual(accepted["current_action_id"], review["id"])
         conflicting = dict(result)
         conflicting["summary"] = "Conflicting retry content."
         before_conflict = self.snapshot()
@@ -426,6 +447,13 @@ class ActionProtocolTests(unittest.TestCase):
         state = json.loads((self.root / ".autodev/state.json").read_text())
         self.assertEqual(state["tasks"]["TASK-001"]["status"], "ACCEPTED")
         self.assertEqual(state["current_action_id"], review["id"])
+        conflicting = dict(result, summary="conflicting immediate Review")
+        before = self.snapshot()
+        self.assertEqual(
+            ActionController(self.root).submit_action_result(review["id"], conflicting).status,
+            "INVALID",
+        )
+        self.assertEqual(self.snapshot(), before)
 
         recovered = ActionController(self.root).submit_action_result(review["id"], result)
 
@@ -460,15 +488,7 @@ class ActionProtocolTests(unittest.TestCase):
         campaign_id = self.approve_without_phase_tasks()
         controller = ActionController(self.root)
         planning = dict(controller.get_next_action(campaign_id).action or {})
-        question = {
-            "id": "approach", "header": "Approach",
-            "question": "Which implementation should be used?",
-            "options": [
-                {"label": "Simple", "description": "Use the smallest implementation."},
-                {"label": "Layered", "description": "Add an abstraction layer."},
-            ],
-            "isOther": False, "isSecret": False,
-        }
+        question = planner_question()
         result = self.passing_result(planning)
         result["data"] = {"phase": "SCAFFOLD", "tasks": [], "questions": [question]}
 
@@ -503,6 +523,139 @@ class ActionProtocolTests(unittest.TestCase):
         )
         self.assertEqual(reached.action["type"], "TARGET_REACHED")
 
+    def test_plan_admission_retries_between_operation_resolve_and_cleanup(self) -> None:
+        campaign_id = self.approve_without_phase_tasks()
+        controller = ActionController(self.root)
+        planning = dict(controller.get_next_action(campaign_id).action or {})
+        result = self.passing_result(planning)
+        result["data"] = {"phase": "SCAFFOLD", "tasks": [task()], "questions": []}
+        from autodev import control_plane
+
+        original = control_plane._atomic_replace_json
+        failed_once = False
+
+        def fail_plan_resolve(path: Path, value: object) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once and path.name == "state.json" and isinstance(value, dict)
+                and value.get("current_action_id") is None
+                and "TASK-001" in value.get("tasks", {})
+            ):
+                failed_once = True
+                raise OSError("injected Planner resolve fault")
+            original(path, value)
+
+        with mock.patch.object(control_plane, "_atomic_replace_json", side_effect=fail_plan_resolve):
+            interrupted = controller.submit_action_result(planning["id"], result)
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        self.assertTrue(Path(planning["workspace"]).exists())
+        self.assertEqual(list(json.loads((self.root / ".autodev/state.json").read_text())["tasks"]), ["TASK-001"])
+        conflicting = dict(result, summary="conflicting Planner result")
+        before = self.snapshot()
+        self.assertEqual(
+            ActionController(self.root).submit_action_result(planning["id"], conflicting).status,
+            "INVALID",
+        )
+        self.assertEqual(self.snapshot(), before)
+
+        recovered = ActionController(self.root).submit_action_result(planning["id"], result)
+
+        self.assertEqual(recovered.action["type"], "EXECUTE_TASK")
+        self.assertEqual(list(json.loads((self.root / ".autodev/state.json").read_text())["tasks"]), ["TASK-001"])
+        self.assertFalse(Path(planning["workspace"]).exists())
+
+    def test_plan_admission_retries_cleanup_after_resolve(self) -> None:
+        campaign_id = self.approve_without_phase_tasks()
+        controller = ActionController(self.root)
+        planning = dict(controller.get_next_action(campaign_id).action or {})
+        result = self.passing_result(planning)
+        result["data"] = {"phase": "SCAFFOLD", "tasks": [task()], "questions": []}
+        original_cleanup = CampaignWorkspace.remove_task_workspace
+        failed_once = False
+
+        def fail_plan_cleanup(owner: CampaignWorkspace, workspace: Path) -> None:
+            nonlocal failed_once
+            intent = json.loads(
+                (self.root / f".autodev/actions/{planning['id']}/finalization.json").read_text()
+            )
+            if (
+                not failed_once and workspace.resolve() == Path(planning["workspace"]).resolve()
+                and intent["phase"] == "PROGRESSED"
+            ):
+                failed_once = True
+                raise CampaignWorkspaceError("injected Planner cleanup fault")
+            original_cleanup(owner, workspace)
+
+        with mock.patch.object(
+            CampaignWorkspace, "remove_task_workspace", autospec=True, side_effect=fail_plan_cleanup,
+        ):
+            interrupted = controller.submit_action_result(planning["id"], result)
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        self.assertTrue(Path(planning["workspace"]).exists())
+        recovered = ActionController(self.root).submit_action_result(planning["id"], result)
+        self.assertEqual(recovered.action["type"], "EXECUTE_TASK")
+        self.assertFalse(Path(planning["workspace"]).exists())
+
+    def _assert_plan_question_recovery(self, fault_window: str) -> None:
+        campaign_id = self.approve_without_phase_tasks()
+        controller = ActionController(self.root)
+        planning = dict(controller.get_next_action(campaign_id).action or {})
+        result = self.passing_result(planning)
+        result["data"] = {
+            "phase": "SCAFFOLD", "tasks": [], "questions": [planner_question()],
+        }
+        if fault_window == "resolve":
+            from autodev import control_plane
+            original = control_plane._atomic_replace_json
+            failed_once = False
+
+            def fail(path: Path, value: object) -> None:
+                nonlocal failed_once
+                if (
+                    not failed_once and path.name == "state.json" and isinstance(value, dict)
+                    and value.get("current_action_id") is None
+                ):
+                    failed_once = True
+                    raise OSError("injected question resolve fault")
+                original(path, value)
+
+            context = mock.patch.object(control_plane, "_atomic_replace_json", side_effect=fail)
+        else:
+            original_cleanup = CampaignWorkspace.remove_task_workspace
+            failed_once = False
+
+            def fail(owner: CampaignWorkspace, workspace: Path) -> None:
+                nonlocal failed_once
+                intent = json.loads(
+                    (self.root / f".autodev/actions/{planning['id']}/finalization.json").read_text()
+                )
+                if (
+                    not failed_once and workspace.resolve() == Path(planning["workspace"]).resolve()
+                    and intent["phase"] == "PROGRESSED"
+                ):
+                    failed_once = True
+                    raise CampaignWorkspaceError("injected question cleanup fault")
+                original_cleanup(owner, workspace)
+
+            context = mock.patch.object(
+                CampaignWorkspace, "remove_task_workspace", autospec=True, side_effect=fail,
+            )
+        with context:
+            interrupted = controller.submit_action_result(planning["id"], result)
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        requests = list((self.root / ".autodev/campaigns/CAMP-001/human-requests").glob("*.json"))
+        self.assertEqual(len(requests), 1)
+        recovered = ActionController(self.root).submit_action_result(planning["id"], result)
+        self.assertEqual(recovered.action["type"], "ASK_HUMAN")
+        self.assertEqual(len(list(requests[0].parent.glob("*.json"))), 1)
+        self.assertFalse(Path(planning["workspace"]).exists())
+
+    def test_plan_questions_retry_between_request_and_resolve(self) -> None:
+        self._assert_plan_question_recovery("resolve")
+
+    def test_plan_questions_retry_cleanup_after_resolve(self) -> None:
+        self._assert_plan_question_recovery("cleanup")
+
     def test_read_only_planner_rejects_a_clean_commit_without_mutation(self) -> None:
         campaign_id = self.approve_without_phase_tasks()
         controller = ActionController(self.root)
@@ -531,6 +684,20 @@ class ActionProtocolTests(unittest.TestCase):
             "blocker": None,
             "next_action": None,
         }
+
+    def diagnostic_action(self, campaign_id: str) -> dict[str, object]:
+        controller = ActionController(self.root)
+        first = dict(controller.get_next_action(campaign_id).action or {})
+        Path(first["workspace"]).joinpath("app.py").write_text("VALUE = 3\n", encoding="utf-8")
+        self.assertEqual(
+            controller.submit_action_result(first["id"], self.passing_result(first)).status,
+            "NOT_READY",
+        )
+        second = dict(controller.get_next_action(campaign_id).action or {})
+        Path(second["workspace"]).joinpath("app.py").write_text("VALUE = 3\n", encoding="utf-8")
+        diagnostic = controller.submit_action_result(second["id"], self.passing_result(second))
+        self.assertEqual(diagnostic.action["type"], "RUN_DIAGNOSTIC")
+        return dict(diagnostic.action)
 
     def test_worker_submission_is_independently_validated_checkpointed_and_retry_safe(self) -> None:
         campaign_id = self.approve()
@@ -1001,6 +1168,13 @@ class ActionProtocolTests(unittest.TestCase):
             (self.root / ".autodev/campaigns/CAMP-001/phase-summary-SCAFFOLD.json").read_text()
         )
         self.assertEqual(summary["status"], "PASSED")
+        conflicting = dict(result, summary="conflicting Phase Review")
+        before = self.snapshot()
+        self.assertEqual(
+            ActionController(self.root).submit_action_result(review["id"], conflicting).status,
+            "INVALID",
+        )
+        self.assertEqual(self.snapshot(), before)
 
         recovered = ActionController(self.root).submit_action_result(review["id"], result)
 
@@ -1024,7 +1198,10 @@ class ActionProtocolTests(unittest.TestCase):
             summary_path = self.root / ".autodev/campaigns/CAMP-001/phase-summary-SCAFFOLD.json"
             if not failed_once and summary_path.is_file():
                 summary = json.loads(summary_path.read_text())
-                if summary.get("status") == "PASSED":
+                if (
+                    summary.get("status") == "PASSED"
+                    and workspace.resolve() == Path(review["workspace"]).resolve()
+                ):
                     failed_once = True
                     raise CampaignWorkspaceError("injected passed Phase Review cleanup fault")
             original_cleanup(owner, workspace)
@@ -1037,7 +1214,14 @@ class ActionProtocolTests(unittest.TestCase):
 
         self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
         state = json.loads((self.root / ".autodev/state.json").read_text())
-        self.assertEqual(state["current_action_id"], review["id"])
+        self.assertNotEqual(state["current_action_id"], review["id"])
+        conflicting = dict(result, summary="conflicting Phase cleanup retry")
+        before = self.snapshot()
+        self.assertEqual(
+            ActionController(self.root).submit_action_result(review["id"], conflicting).status,
+            "INVALID",
+        )
+        self.assertEqual(self.snapshot(), before)
 
         recovered = ActionController(self.root).submit_action_result(review["id"], result)
 
@@ -1248,6 +1432,77 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertEqual(rejected.status, "INVALID", rejected)
         self.assertIn("read-only", rejected.message)
         self.assertEqual(self.snapshot(), before)
+
+    def test_diagnostic_retries_between_artifact_and_action_resolve(self) -> None:
+        campaign_id = self.approve()
+        diagnostic = self.diagnostic_action(campaign_id)
+        result = self.passing_result(diagnostic)
+        result["data"] = {"diagnosis": {
+            "root_cause": "The implementation used the wrong value.",
+            "evidence": ["Validation expected VALUE = 2."],
+            "recommended_action": "Retry with the required value.",
+        }}
+        from autodev import control_plane
+        original = control_plane._atomic_replace_json
+        failed_once = False
+
+        def fail_diagnostic_resolve(path: Path, value: object) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once and path.name == "state.json" and isinstance(value, dict)
+                and value.get("current_action_id") is None
+            ):
+                failed_once = True
+                raise OSError("injected Diagnostic resolve fault")
+            original(path, value)
+
+        with mock.patch.object(
+            control_plane, "_atomic_replace_json", side_effect=fail_diagnostic_resolve,
+        ):
+            interrupted = ActionController(self.root).submit_action_result(diagnostic["id"], result)
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        self.assertTrue(Path(diagnostic["workspace"]).exists())
+        conflicting = dict(result, summary="conflicting diagnosis")
+        before = self.snapshot()
+        self.assertEqual(
+            ActionController(self.root).submit_action_result(diagnostic["id"], conflicting).status,
+            "INVALID",
+        )
+        self.assertEqual(self.snapshot(), before)
+        recovered = ActionController(self.root).submit_action_result(diagnostic["id"], result)
+        self.assertEqual(recovered.action["type"], "EXECUTE_TASK")
+        self.assertFalse(Path(diagnostic["workspace"]).exists())
+
+    def test_diagnostic_retries_cleanup_after_resolve(self) -> None:
+        campaign_id = self.approve()
+        diagnostic = self.diagnostic_action(campaign_id)
+        result = self.passing_result(diagnostic)
+        original_cleanup = CampaignWorkspace.remove_task_workspace
+        failed_once = False
+
+        def fail_diagnostic_cleanup(owner: CampaignWorkspace, workspace: Path) -> None:
+            nonlocal failed_once
+            intent = json.loads(
+                (self.root / f".autodev/actions/{diagnostic['id']}/finalization.json").read_text()
+            )
+            if (
+                not failed_once and workspace.resolve() == Path(diagnostic["workspace"]).resolve()
+                and intent["phase"] == "PROGRESSED"
+            ):
+                failed_once = True
+                raise CampaignWorkspaceError("injected Diagnostic cleanup fault")
+            original_cleanup(owner, workspace)
+
+        with mock.patch.object(
+            CampaignWorkspace, "remove_task_workspace", autospec=True,
+            side_effect=fail_diagnostic_cleanup,
+        ):
+            interrupted = ActionController(self.root).submit_action_result(diagnostic["id"], result)
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        self.assertTrue(Path(diagnostic["workspace"]).exists())
+        recovered = ActionController(self.root).submit_action_result(diagnostic["id"], result)
+        self.assertEqual(recovered.action["type"], "EXECUTE_TASK")
+        self.assertFalse(Path(diagnostic["workspace"]).exists())
 
 
 if __name__ == "__main__":

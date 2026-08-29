@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -132,6 +132,12 @@ class ActionController:
                 return ActionOutcome("INFRA_FAILURE", f"accepted Action cannot be recovered: {error}")
             if accepted != result:
                 return ActionOutcome("INVALID", "conflicting duplicate Action result")
+            try:
+                finalization = self._read_finalization(action)
+            except CampaignWorkspaceError as error:
+                return ActionOutcome("INFRA_FAILURE", str(error))
+            if finalization is not None and finalization.get("phase") != "COMMITTED":
+                return self._resume_finalization(action, dict(result))
             state = self._read_state()
             if state.get("current_action_id") == action_id:
                 reconciled = self._control.execute(Command("action.resolve", {
@@ -193,8 +199,20 @@ class ActionController:
             and state_revision > action_revision
             and self._only_processing_events(action, action_revision, state_revision)
         )
+        try:
+            finalization = self._read_finalization(action)
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INFRA_FAILURE", str(error))
+        recoverable_finalization = (
+            finalization is not None
+            and finalization.get("result_hash") == _hash(result)
+            and finalization.get("action_id") == action_id
+        )
+        if finalization is not None and not recoverable_finalization:
+            return ActionOutcome("INVALID", "Action result conflicts with finalization intent")
         if result.get("canonical_revision") != action_revision or not (
             revision_is_current or graceful_pause_only or recoverable_processing
+            or recoverable_finalization
         ):
             return ActionOutcome("INVALID", "stale Action revision")
         task = state.get("tasks", {}).get(action.get("task_id"), {})
@@ -210,9 +228,6 @@ class ActionController:
         if action["type"] == "RUN_IMMEDIATE_REVIEW":
             return self._submit_review(action, dict(result))
         if action["type"] == "RUN_PHASE_REVIEW":
-            recovered_phase = self._recover_passed_phase_review(action, dict(result))
-            if recovered_phase is not None:
-                return recovered_phase
             return self._submit_phase_review(action, dict(result))
         if action["type"] == "RUN_DIAGNOSTIC":
             return self._submit_diagnostic(action, dict(result))
@@ -234,23 +249,29 @@ class ActionController:
 
     def _submit_plan(self, action: dict[str, Any], result: dict[str, Any]) -> ActionOutcome:
         data = result["data"]
-        workspace = Path(action["workspace"]).resolve()
-        read_only = self._verify_read_only(action, "Planner", "planning")
-        if read_only is not None:
-            return read_only
         if result["outcome"] != "PASS":
             return ActionOutcome("INVALID", "Phase Planner must return PASS with a frozen batch")
         if data.get("phase") != action["phase"]:
             return ActionOutcome("INVALID", "Phase Planner returned the wrong phase")
         tasks = data.get("tasks")
         questions = data.get("questions", [])
-        if questions:
+        if not questions and (not isinstance(tasks, list) or not tasks):
+            return ActionOutcome("INVALID", "Phase Planner returned no Tasks")
+        intent = self._read_finalization(action)
+        if intent is None:
+            read_only = self._verify_read_only(action, "Planner", "planning")
+            if read_only is not None:
+                return read_only
+        try:
+            intent = self._prepare_finalization(action, result, "PLAN_PHASE")
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INVALID", str(error))
+        if intent["phase"] == "PREPARED":
+            read_only = self._verify_read_only(action, "Planner", "planning")
+            if read_only is not None:
+                return read_only
+        if questions and intent["phase"] == "PREPARED":
             request_id = f"{action['campaign_id']}-plan-{str(action['id'])[7:19]}"
-            requested = CampaignController(self._root)._request_planner_questions(
-                str(action["campaign_id"]), questions, request_id=request_id,
-            )
-            if requested.status not in {"SUCCESS", "NOT_READY"}:
-                return ActionOutcome(requested.status, requested.message, data=requested.data)
             _write_json_atomic(
                 self._canonical / "campaigns" / str(action["campaign_id"]) / "native-plan-context.json",
                 {
@@ -262,38 +283,45 @@ class ActionController:
                     ),
                 },
             )
-            CampaignWorkspace(self._root, str(action["campaign_id"])).remove_task_workspace(workspace)
-            resolved = self._resolve(
-                action, result, ActionOutcome("NOT_READY", "Planner questions are waiting for answers"),
+            requested = CampaignController(self._root)._request_planner_questions(
+                str(action["campaign_id"]), questions, request_id=request_id,
             )
-            if resolved.status not in {"SUCCESS", "NOT_READY"}:
-                return resolved
-            final = self.get_next_action(str(action["campaign_id"]))
-            _write_json_atomic(
-                self._canonical / "actions" / action["id"] / "outcome.json",
-                self._outcome_dict(final),
-            )
-            return final
-        if not isinstance(tasks, list) or not tasks:
-            return ActionOutcome("INVALID", "Phase Planner returned no Tasks")
-        admitted = CampaignController(self._root).admit(str(action["campaign_id"]), tasks)
-        if admitted.status != "SUCCESS":
-            return ActionOutcome(admitted.status, admitted.message, data=admitted.data)
-        if action["context"].get("purpose") == "PHASE_REPAIR":
-            flow = self._read_phase_flow(str(action["campaign_id"]), str(action["phase"]))
-            flow["status"] = "ACTIVE"
-            self._write_phase_flow(str(action["campaign_id"]), str(action["phase"]), flow)
-        CampaignWorkspace(self._root, str(action["campaign_id"])).remove_task_workspace(workspace)
-        provisional = ActionOutcome("SUCCESS", f"Action {action['id']} accepted")
-        resolved = self._resolve(action, result, provisional)
-        if resolved.status != "SUCCESS":
-            return resolved
-        final = self.get_next_action(str(action["campaign_id"]))
-        _write_json_atomic(
-            self._canonical / "actions" / action["id"] / "outcome.json",
-            self._outcome_dict(final),
+            if requested.status not in {"SUCCESS", "NOT_READY"}:
+                return ActionOutcome(requested.status, requested.message, data=requested.data)
+            intent = self._mark_finalization(action, intent, "OPERATED")
+        elif intent["phase"] == "PREPARED":
+            task_ids = [str(item["id"]) for item in tasks]
+            state = self._read_state()
+            existing = [task_id for task_id in task_ids if task_id in state.get("tasks", {})]
+            if existing and len(existing) != len(task_ids):
+                return ActionOutcome("INFRA_FAILURE", "Planner admission is only partially durable")
+            if existing:
+                for item in tasks:
+                    contract = self._task_contract(str(item["id"]))
+                    if any(
+                        contract.get(key) != value
+                        for key, value in item.items() if key != "prohibited_actions"
+                    ) or not set(item.get("prohibited_actions", ())).issubset(
+                        contract.get("prohibited_actions", ())
+                    ):
+                        return ActionOutcome("INVALID", "Planner admission conflicts with durable Tasks")
+            else:
+                admitted = CampaignController(self._root).admit(str(action["campaign_id"]), tasks)
+                if admitted.status != "SUCCESS":
+                    return ActionOutcome(admitted.status, admitted.message, data=admitted.data)
+            if action["context"].get("purpose") == "PHASE_REPAIR":
+                flow = self._read_phase_flow(str(action["campaign_id"]), str(action["phase"]))
+                flow["status"] = "ACTIVE"
+                self._write_phase_flow(str(action["campaign_id"]), str(action["phase"]), flow)
+            intent = self._mark_finalization(action, intent, "OPERATED")
+        provisional = (
+            ActionOutcome("NOT_READY", "Planner questions are waiting for answers")
+            if questions else ActionOutcome("SUCCESS", f"Action {action['id']} accepted")
         )
-        return final
+        return self._complete_finalization(
+            action, result, intent, provisional,
+            lambda: self.get_next_action(str(action["campaign_id"])),
+        )
 
     def _read_state(self) -> dict[str, Any]:
         return json.loads((self._canonical / "state.json").read_text(encoding="utf-8"))
@@ -837,37 +865,51 @@ class ActionController:
     def _submit_diagnostic(
         self, action: dict[str, Any], result: dict[str, Any],
     ) -> ActionOutcome:
-        workspace = Path(action["workspace"]).resolve()
-        read_only = self._verify_read_only(action, "Diagnostic", "Diagnostic")
-        if read_only is not None:
-            return read_only
+        intent = self._read_finalization(action)
+        if intent is None:
+            read_only = self._verify_read_only(action, "Diagnostic", "Diagnostic")
+            if read_only is not None:
+                return read_only
+        try:
+            intent = self._prepare_finalization(action, result, "RUN_DIAGNOSTIC")
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INVALID", str(error))
+        if intent["phase"] == "PREPARED":
+            read_only = self._verify_read_only(action, "Diagnostic", "Diagnostic")
+            if read_only is not None:
+                return read_only
         run_id = str(action["context"]["run_id"])
-        _write_json_atomic(self._canonical / "runs" / run_id / "diagnostic.json", result)
-        CampaignWorkspace(self._root, str(action["campaign_id"])).remove_task_workspace(workspace)
         phase_scope = action.get("context", {}).get("scope") == "PHASE"
-        if result["outcome"] == "BLOCKED":
-            blocked = self._control.execute(Command("project.transition", {
-                "to": "BLOCKED", "blocker": result["blocker"],
-                "next_action": result["next_action"],
-            }))
-            if blocked.status != "SUCCESS":
-                return ActionOutcome(blocked.status, blocked.message, data=blocked.data)
-        elif phase_scope:
-            flow = self._read_phase_flow(str(action["campaign_id"]), str(action["phase"]))
-            flow["status"] = "REPAIR_PLAN"
-            self._write_phase_flow(str(action["campaign_id"]), str(action["phase"]), flow)
-        resolved = self._resolve(
-            action, result,
+        if intent["phase"] == "PREPARED":
+            diagnostic_path = self._canonical / "runs" / run_id / "diagnostic.json"
+            if diagnostic_path.is_file():
+                if json.loads(diagnostic_path.read_text(encoding="utf-8")) != result:
+                    return ActionOutcome("INVALID", "Diagnostic result conflicts with durable artifact")
+            else:
+                _write_json_atomic(diagnostic_path, result)
+            if result["outcome"] == "BLOCKED":
+                state = self._read_state()
+                if not (
+                    state.get("project_status") == "BLOCKED"
+                    and state.get("blocker") == result["blocker"]
+                    and state.get("next_action") == result["next_action"]
+                ):
+                    blocked = self._control.execute(Command("project.transition", {
+                        "to": "BLOCKED", "blocker": result["blocker"],
+                        "next_action": result["next_action"],
+                    }))
+                    if blocked.status != "SUCCESS":
+                        return ActionOutcome(blocked.status, blocked.message, data=blocked.data)
+            elif phase_scope:
+                flow = self._read_phase_flow(str(action["campaign_id"]), str(action["phase"]))
+                flow["status"] = "REPAIR_PLAN"
+                self._write_phase_flow(str(action["campaign_id"]), str(action["phase"]), flow)
+            intent = self._mark_finalization(action, intent, "OPERATED")
+        return self._complete_finalization(
+            action, result, intent,
             ActionOutcome("SUCCESS", f"Diagnostic {action['id']} accepted"),
+            lambda: self.get_next_action(str(action["campaign_id"])),
         )
-        if resolved.status != "SUCCESS":
-            return resolved
-        final = self.get_next_action(str(action["campaign_id"]))
-        _write_json_atomic(
-            self._canonical / "actions" / action["id"] / "outcome.json",
-            self._outcome_dict(final),
-        )
-        return final
 
     def _create_immediate_review(
         self, worker: Mapping[str, Any], workspace: Path, attempt: Mapping[str, Any],
@@ -947,10 +989,6 @@ class ActionController:
     def _submit_phase_review(
         self, action: dict[str, Any], result: dict[str, Any],
     ) -> ActionOutcome:
-        workspace = Path(action["workspace"]).resolve()
-        read_only = self._verify_read_only(action, "Phase Reviewer", "Phase Review")
-        if read_only is not None:
-            return read_only
         budget = self._attempts.budget
         debt_items = result["data"].get("debt_items", [])
         budget_errors = self._attempts.review_budget_errors(result)
@@ -959,122 +997,99 @@ class ActionController:
         campaign_id = str(action["campaign_id"])
         phase = str(action["phase"])
         flow = self._read_phase_flow(campaign_id, phase)
-        if result["outcome"] not in {"PASS", "PASS_WITH_DEBT"}:
-            CampaignWorkspace(self._root, str(action["campaign_id"])).remove_task_workspace(workspace)
+        intent = self._read_finalization(action)
+        if intent is None:
+            read_only = self._verify_read_only(action, "Phase Reviewer", "Phase Review")
+            if read_only is not None:
+                return read_only
+        try:
+            intent = self._prepare_finalization(action, result, "RUN_PHASE_REVIEW")
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INVALID", str(error))
+        if intent["phase"] == "PREPARED":
+            read_only = self._verify_read_only(action, "Phase Reviewer", "Phase Review")
+            if read_only is not None:
+                return read_only
+        if result["outcome"] not in {"PASS", "PASS_WITH_DEBT"} and intent["phase"] == "PREPARED":
             if result["outcome"] == "REWORK" and int(flow.get("review_attempts", 0)) < (
                 budget.phase_reviews + budget.phase_rereviews
             ):
                 flow["status"] = "REPAIR_PLAN"
                 self._write_phase_flow(campaign_id, phase, flow)
-                provisional = ActionOutcome(
-                    "SUCCESS", result["summary"], data={"findings": result["findings"]},
+            else:
+                blocker = result.get("blocker") or "Phase Review budget exhausted."
+                next_action = result.get("next_action") or "Revise the Phase plan or explicitly change its quality budget."
+                state = self._read_state()
+                if not (
+                    state.get("project_status") == "BLOCKED"
+                    and state.get("blocker") == blocker
+                    and state.get("next_action") == next_action
+                ):
+                    blocked = self._control.execute(Command("project.transition", {
+                        "to": "BLOCKED", "blocker": blocker, "next_action": next_action,
+                    }))
+                    if blocked.status != "SUCCESS":
+                        return ActionOutcome(blocked.status, blocked.message, data=blocked.data)
+            intent = self._mark_finalization(action, intent, "OPERATED")
+        elif intent["phase"] == "PREPARED":
+            if result["outcome"] == "PASS_WITH_DEBT":
+                try:
+                    debt = json.loads((self._canonical / "debt.json").read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    debt = {"items": []}
+                existing = {item["id"]: item for item in debt.get("items", [])}
+                expected = {item["id"]: {**item, "status": "OPEN"} for item in debt_items}
+                if any(key in existing and existing[key] != value for key, value in expected.items()):
+                    return ActionOutcome("INVALID", "Phase debt conflicts with durable debt")
+                if not all(existing.get(key) == value for key, value in expected.items()):
+                    recorded = self._control.execute(Command("debt.record", {
+                        "campaign_id": campaign_id, "phase": phase, "debt_items": debt_items,
+                    }))
+                    if recorded.status != "SUCCESS":
+                        return ActionOutcome(recorded.status, recorded.message, data=recorded.data)
+            state = self._read_state()
+            checkpoint = state["campaigns"][campaign_id]["checkpoint"]
+            try:
+                phase_context = json.loads(
+                    (self._canonical / str(action["context"]["phase_context_ref"])).read_text(
+                        encoding="utf-8",
+                    )
                 )
-                resolved = self._resolve(action, result, provisional)
-                if resolved.status != "SUCCESS":
-                    return resolved
-                final = self.get_next_action(campaign_id)
-                _write_json_atomic(
-                    self._canonical / "actions" / action["id"] / "outcome.json",
-                    self._outcome_dict(final),
-                )
-                return final
-            blocker = result.get("blocker") or "Phase Review budget exhausted."
-            next_action = result.get("next_action") or "Revise the Phase plan or explicitly change its quality budget."
-            blocked = self._control.execute(Command("project.transition", {
-                "to": "BLOCKED", "blocker": blocker, "next_action": next_action,
-            }))
-            if blocked.status != "SUCCESS":
-                return ActionOutcome(blocked.status, blocked.message, data=blocked.data)
-            provisional = ActionOutcome("BLOCKED", result["summary"], data={"findings": result["findings"]})
-            resolved = self._resolve(action, result, provisional)
-            if resolved.status != "BLOCKED":
-                return resolved
-            final = self.get_next_action(campaign_id)
-            _write_json_atomic(
-                self._canonical / "actions" / action["id"] / "outcome.json",
-                self._outcome_dict(final),
-            )
-            return final
-        if result["outcome"] == "PASS_WITH_DEBT":
-            recorded = self._control.execute(Command("debt.record", {
-                "campaign_id": campaign_id, "phase": phase, "debt_items": debt_items,
-            }))
-            if recorded.status != "SUCCESS":
-                return ActionOutcome(recorded.status, recorded.message, data=recorded.data)
-        state = self._read_state()
-        checkpoint = state["campaigns"][campaign_id]["checkpoint"]
-        try:
-            phase_context = json.loads(
-                (self._canonical / str(action["context"]["phase_context_ref"])).read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError) as error:
-            return ActionOutcome("INFRA_FAILURE", f"Phase Review context cannot be recovered: {error}")
-        _write_json_atomic(
-            self._canonical / "campaigns" / campaign_id / f"phase-summary-{phase}.json",
-            {
+            except (OSError, json.JSONDecodeError) as error:
+                return ActionOutcome("INFRA_FAILURE", f"Phase Review context cannot be recovered: {error}")
+            summary = {
                 "campaign_id": campaign_id, "phase": phase, "status": "PASSED",
                 "checkpoint": checkpoint, "validations": phase_context["validations"],
                 "review": result, "review_attempts": int(flow.get("review_attempts", 0)),
-            },
-        )
-        cleanup = self._safe_cleanup(campaign_id, workspace)
-        if cleanup is not None:
-            return cleanup
-        resolved = self._resolve(
-            action, result, ActionOutcome("SUCCESS", f"Phase Review {action['id']} accepted"),
-        )
-        if resolved.status != "SUCCESS":
-            return resolved
-        gated = CampaignController(self._root).phase_gate(campaign_id)
-        if gated.status not in {"SUCCESS", "NOT_READY"}:
-            return ActionOutcome(gated.status, gated.message, data=gated.data)
-        final = self.get_next_action(campaign_id)
-        _write_json_atomic(
-            self._canonical / "actions" / action["id"] / "outcome.json",
-            self._outcome_dict(final),
-        )
-        return final
+            }
+            summary_path = self._canonical / "campaigns" / campaign_id / f"phase-summary-{phase}.json"
+            if summary_path.is_file():
+                if json.loads(summary_path.read_text(encoding="utf-8")) != summary:
+                    return ActionOutcome("INVALID", "Phase Review conflicts with durable summary")
+            else:
+                _write_json_atomic(summary_path, summary)
+            intent = self._mark_finalization(action, intent, "OPERATED")
 
-    def _recover_passed_phase_review(
-        self, action: dict[str, Any], result: dict[str, Any],
-    ) -> ActionOutcome | None:
-        campaign_id = str(action["campaign_id"])
-        phase = str(action["phase"])
-        summary_path = self._canonical / "campaigns" / campaign_id / f"phase-summary-{phase}.json"
-        if not summary_path.is_file():
-            return None
-        try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as error:
-            return ActionOutcome("INFRA_FAILURE", f"passed Phase Review cannot be recovered: {error}")
-        state = self._read_state()
-        campaign = state.get("campaigns", {}).get(campaign_id, {})
-        if (
-            summary.get("status") != "PASSED"
-            or summary.get("phase") != phase
-            or summary.get("checkpoint") != campaign.get("checkpoint")
-        ):
-            return None
-        if summary.get("review") != result:
-            return ActionOutcome("INVALID", "Phase Review result conflicts with canonical summary")
-        cleanup = self._safe_cleanup(campaign_id, Path(action["workspace"]))
-        if cleanup is not None:
-            return cleanup
-        resolved = self._resolve(
-            action, result, ActionOutcome("SUCCESS", f"Phase Review {action['id']} recovered"),
+        passing = result["outcome"] in {"PASS", "PASS_WITH_DEBT"}
+        reworking = result["outcome"] == "REWORK" and int(flow.get("review_attempts", 0)) < (
+            budget.phase_reviews + budget.phase_rereviews
         )
-        if resolved.status != "SUCCESS":
-            return resolved
-        gated = CampaignController(self._root).phase_gate(campaign_id)
-        if gated.status not in {"SUCCESS", "NOT_READY"}:
-            final = ActionOutcome(gated.status, gated.message, data=gated.data)
-        else:
-            final = self.get_next_action(campaign_id)
-        _write_json_atomic(
-            self._canonical / "actions" / action["id"] / "outcome.json",
-            self._outcome_dict(final),
+        provisional = ActionOutcome(
+            "SUCCESS" if passing or reworking else "BLOCKED",
+            f"Phase Review {action['id']} accepted" if passing else result["summary"],
+            data={} if passing else {"findings": result["findings"]},
         )
-        return final
+
+        def progress() -> ActionOutcome:
+            state = self._read_state()
+            campaign = state["campaigns"][campaign_id]
+            if passing and campaign.get("phase") == phase and campaign.get("status") == "ACTIVE":
+                gated = CampaignController(self._root).phase_gate(campaign_id)
+                if gated.status not in {"SUCCESS", "NOT_READY"}:
+                    return ActionOutcome(gated.status, gated.message, data=gated.data)
+            return self.get_next_action(campaign_id)
+
+        return self._complete_finalization(action, result, intent, provisional, progress)
 
     def _accept_changes(
         self, action: dict[str, Any], result: dict[str, Any], patch: bytes,
@@ -1096,6 +1111,12 @@ class ActionController:
                 "INVALID", "debt gate rejected Action result", data={"errors": debt_errors},
             )
         pause_after_action = bool(self._read_state().get("pause_requested"))
+        try:
+            intent = self._prepare_finalization(
+                action, submitted_result or result, "ACCEPT_CHANGES",
+            )
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INVALID", str(error))
         evidence_id: str | None = None
 
         def write_acceptance_evidence(checkpoint: Any) -> None:
@@ -1120,26 +1141,26 @@ class ActionController:
         )
         if finished.status != "SUCCESS":
             return ActionOutcome(finished.status, finished.message, data=finished.data)
-        cleanup = self._safe_cleanup(campaign_id, workspace)
-        if cleanup is not None:
-            return cleanup
+        intent = self._mark_finalization(action, intent, "OPERATED")
         provisional = ActionOutcome("SUCCESS", f"Action {action['id']} accepted")
-        resolved = self._resolve(action, submitted_result or result, provisional)
-        if resolved.status != "SUCCESS":
-            return resolved
-        if pause_after_action:
-            final = self.get_next_action(campaign_id)
-        else:
-            progressed = CampaignController(self._root).phase_gate(campaign_id)
-            if progressed.status not in {"SUCCESS", "NOT_READY"}:
-                final = ActionOutcome(progressed.status, progressed.message, data=progressed.data)
-            else:
-                final = self.get_next_action(campaign_id)
-        _write_json_atomic(
-            self._canonical / "actions" / action["id"] / "outcome.json",
-            self._outcome_dict(final),
+
+        def progress() -> ActionOutcome:
+            state = self._read_state()
+            campaign = state["campaigns"][campaign_id]
+            if (
+                not pause_after_action
+                and state.get("project_status") == "ACTIVE"
+                and campaign.get("status") == "ACTIVE"
+                and campaign.get("phase") == action.get("phase")
+            ):
+                progressed = CampaignController(self._root).phase_gate(campaign_id)
+                if progressed.status not in {"SUCCESS", "NOT_READY"}:
+                    return ActionOutcome(progressed.status, progressed.message, data=progressed.data)
+            return self.get_next_action(campaign_id)
+
+        return self._complete_finalization(
+            action, submitted_result or result, intent, provisional, progress,
         )
-        return final
 
     def _recover_accepted_action(
         self, action: dict[str, Any], result: dict[str, Any],
@@ -1161,25 +1182,31 @@ class ActionController:
             or evidence.get("evidence_id") not in task.get("evidence_ids", [])
         ):
             return ActionOutcome("INVALID", "accepted Action result conflicts with canonical evidence")
-        cleanup = self._safe_cleanup(str(action["campaign_id"]), Path(action["workspace"]))
-        if cleanup is not None:
-            return cleanup
-        resolved = self._resolve(
-            action, result, ActionOutcome("SUCCESS", f"Action {action['id']} recovered"),
-        )
-        if resolved.status != "SUCCESS":
-            return resolved
         campaign_id = str(action["campaign_id"])
-        progressed = CampaignController(self._root).phase_gate(campaign_id)
-        if progressed.status not in {"SUCCESS", "NOT_READY"}:
-            final = ActionOutcome(progressed.status, progressed.message, data=progressed.data)
-        else:
-            final = self.get_next_action(campaign_id)
-        _write_json_atomic(
-            self._canonical / "actions" / action["id"] / "outcome.json",
-            self._outcome_dict(final),
+        try:
+            intent = self._prepare_finalization(action, result, "ACCEPT_CHANGES")
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INVALID", str(error))
+        if intent["phase"] == "PREPARED":
+            intent = self._mark_finalization(action, intent, "OPERATED")
+
+        def progress() -> ActionOutcome:
+            state = self._read_state()
+            campaign = state["campaigns"][campaign_id]
+            if (
+                state.get("project_status") == "ACTIVE"
+                and campaign.get("status") == "ACTIVE"
+                and campaign.get("phase") == action.get("phase")
+            ):
+                progressed = CampaignController(self._root).phase_gate(campaign_id)
+                if progressed.status not in {"SUCCESS", "NOT_READY"}:
+                    return ActionOutcome(progressed.status, progressed.message, data=progressed.data)
+            return self.get_next_action(campaign_id)
+
+        return self._complete_finalization(
+            action, result, intent,
+            ActionOutcome("SUCCESS", f"Action {action['id']} recovered"), progress,
         )
-        return final
 
     def _safe_cleanup(self, campaign_id: str, workspace: Path) -> ActionOutcome | None:
         try:
@@ -1194,23 +1221,44 @@ class ActionController:
     ) -> ActionOutcome:
         run_id = str(action["context"]["run_id"])
         outcome = result["outcome"]
-        evidence_id = self._write_evidence(
-            action, result, patch or b"", changed_paths or [], [], None,
-            review=result if action.get("role") == "reviewer" else None,
-        )
-        finished = self._attempts.finish(
-            run_id=run_id, outcome=outcome, evidence_id=evidence_id, result=result,
-        )
-        if finished.status != "SUCCESS":
-            return ActionOutcome(finished.status, finished.message, data=finished.data)
-        CampaignWorkspace(self._root, str(action["campaign_id"])).remove_task_workspace(
-            Path(action["workspace"])
-        )
+        try:
+            intent = self._prepare_finalization(action, result, "NONPASSING")
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INVALID", str(error))
+        if intent["phase"] == "PREPARED":
+            state = self._read_state()
+            if state.get("current_run_id") == run_id:
+                evidence_id = self._write_evidence(
+                    action, result, patch or b"", changed_paths or [], [], None,
+                    review=result if action.get("role") == "reviewer" else None,
+                )
+                finished = self._attempts.finish(
+                    run_id=run_id, outcome=outcome, evidence_id=evidence_id, result=result,
+                )
+                if finished.status != "SUCCESS":
+                    return ActionOutcome(finished.status, finished.message, data=finished.data)
+            else:
+                try:
+                    evidence = json.loads(
+                        (self._canonical / "runs" / run_id / "evidence.json").read_text(
+                            encoding="utf-8",
+                        )
+                    )
+                except (OSError, json.JSONDecodeError) as error:
+                    return ActionOutcome(
+                        "INFRA_FAILURE", f"nonpassing Action evidence cannot be recovered: {error}",
+                    )
+                if (
+                    evidence.get("action_id") != action["id"]
+                    or evidence.get("result_hash") != _hash(result)
+                ):
+                    return ActionOutcome("INVALID", "nonpassing result conflicts with evidence")
+            intent = self._mark_finalization(action, intent, "OPERATED")
         final = ActionOutcome(
             "BLOCKED" if outcome == "BLOCKED" else "NOT_READY",
             result["summary"], data={"findings": result["findings"]},
         )
-        return self._resolve(action, result, final)
+        return self._complete_finalization(action, result, intent, final, lambda: final)
 
     def _resolve(
         self, action: Mapping[str, Any], result: Mapping[str, Any], outcome: ActionOutcome,
@@ -1222,6 +1270,123 @@ class ActionController:
         if recorded.status != "SUCCESS":
             return ActionOutcome(recorded.status, recorded.message, data=recorded.data)
         return outcome
+
+    def _finalization_path(self, action: Mapping[str, Any]) -> Path:
+        return self._canonical / "actions" / str(action["id"]) / "finalization.json"
+
+    def _read_finalization(self, action: Mapping[str, Any]) -> dict[str, Any] | None:
+        path = self._finalization_path(action)
+        if not path.is_file():
+            return None
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise CampaignWorkspaceError(f"Action finalization intent is invalid: {error}") from error
+        phases = {"PREPARED", "OPERATED", "RESOLVED", "PROGRESSED", "COMMITTED"}
+        if (
+            not isinstance(document, dict)
+            or document.get("phase") not in phases
+            or not isinstance(document.get("result_hash"), str)
+            or (
+                document.get("phase") in {"PROGRESSED", "COMMITTED"}
+                and not isinstance(document.get("outcome"), dict)
+            )
+        ):
+            raise CampaignWorkspaceError("Action finalization intent has an invalid contract")
+        return document
+
+    def _prepare_finalization(
+        self, action: Mapping[str, Any], result: Mapping[str, Any], kind: str,
+    ) -> dict[str, Any]:
+        existing = self._read_finalization(action)
+        if existing is not None:
+            if (
+                existing.get("action_id") != action["id"]
+                or existing.get("result_hash") != _hash(result)
+                or existing.get("kind") != kind
+            ):
+                raise CampaignWorkspaceError("Action finalization intent conflicts with the result")
+            return existing
+        intent = {
+            "schema_version": 1, "action_id": action["id"], "kind": kind,
+            "result_hash": _hash(result), "phase": "PREPARED",
+        }
+        _write_json_atomic(self._finalization_path(action), intent)
+        return intent
+
+    def _mark_finalization(
+        self, action: Mapping[str, Any], intent: dict[str, Any], phase: str,
+        *, outcome: ActionOutcome | None = None,
+    ) -> dict[str, Any]:
+        intent = dict(intent, phase=phase)
+        if outcome is not None:
+            intent["outcome"] = self._outcome_dict(outcome)
+        _write_json_atomic(self._finalization_path(action), intent)
+        return intent
+
+    def _complete_finalization(
+        self, action: Mapping[str, Any], result: Mapping[str, Any],
+        intent: dict[str, Any], provisional: ActionOutcome,
+        progress: Callable[[], ActionOutcome],
+    ) -> ActionOutcome:
+        if intent["phase"] == "OPERATED":
+            state = self._read_state()
+            if state.get("current_action_id") == action["id"]:
+                resolved = self._resolve(action, result, provisional)
+                if resolved.status != provisional.status:
+                    return resolved
+            else:
+                try:
+                    accepted = json.loads(
+                        (self._canonical / "actions" / str(action["id"]) / "result.json").read_text(
+                            encoding="utf-8",
+                        )
+                    )
+                except (OSError, json.JSONDecodeError) as error:
+                    return ActionOutcome(
+                        "INFRA_FAILURE", f"resolved Action cannot be recovered: {error}",
+                    )
+                if accepted != result:
+                    return ActionOutcome("INVALID", "resolved Action result conflicts with intent")
+            intent = self._mark_finalization(action, intent, "RESOLVED")
+        if intent["phase"] == "RESOLVED":
+            try:
+                final = progress()
+            except (CampaignWorkspaceError, OSError, RuntimeError) as error:
+                return ActionOutcome("INFRA_FAILURE", f"Action progression must be retried: {error}")
+            if final.status == "INFRA_FAILURE":
+                return final
+            _write_json_atomic(
+                self._canonical / "actions" / str(action["id"]) / "outcome.json",
+                self._outcome_dict(final),
+            )
+            intent = self._mark_finalization(action, intent, "PROGRESSED", outcome=final)
+        else:
+            final = self._outcome_from(intent["outcome"])
+        if intent["phase"] == "PROGRESSED":
+            cleanup = self._safe_cleanup(
+                str(action["campaign_id"]), Path(str(action["workspace"])),
+            )
+            if cleanup is not None:
+                return cleanup
+            self._mark_finalization(action, intent, "COMMITTED", outcome=final)
+        return final
+
+    def _resume_finalization(
+        self, action: dict[str, Any], result: dict[str, Any],
+    ) -> ActionOutcome:
+        if action["type"] == "PLAN_PHASE":
+            return self._submit_plan(action, result)
+        if action["type"] == "RUN_DIAGNOSTIC":
+            return self._submit_diagnostic(action, result)
+        if action["type"] == "RUN_PHASE_REVIEW":
+            return self._submit_phase_review(action, result)
+        intent = self._read_finalization(action) or {}
+        if intent.get("kind") == "NONPASSING":
+            return self._finish_nonpassing(action, result)
+        if action["type"] in {"EXECUTE_TASK", "RUN_IMMEDIATE_REVIEW"}:
+            return self._recover_accepted_action(action, result)
+        return ActionOutcome("INFRA_FAILURE", "unknown Action finalization intent")
 
     def _validations(self, contract: Mapping[str, Any], workspace: Path) -> list[dict[str, Any]]:
         return self._attempts.run_validations(contract, workspace)
