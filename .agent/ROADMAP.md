@@ -38,17 +38,16 @@
   specialists, single-Worker rule, and no hooks/UI. TASK-011 is `ACCEPTED` by MCP, validator,
   package-install, and plugin-layout smokes.
 
-## In review
-
 ### M11-V4-RELEASE-GATE — Documentation, acceptance, and review
 
-- Completed: README V4 normal/recovery/migration/headless guidance; handoff/state refresh;
-  MCP-enabled `171/171` regression; wheel build and isolated install/stdio smoke; Plugin/Skill/
-  marketplace validation.
-- Pending: separate Standards and `v4.md` Spec reviews fixed at `v3.0.0a1`; blocking-finding fixes;
-  focused rereview; final post-fix full verification and acceptance record.
-- TASK-012 remains `REVIEW` until both review axes are non-blocking. No push, publish, deploy, or
-  unauthorized live model Campaign is permitted.
+- README V4 normal/recovery/migration/headless guidance, handoff/state, package/plugin evidence,
+  and the final acceptance record are complete.
+- Independent Standards and `v4.md` Spec reviews used fixed point `v3.0.0a1`. Review-driven
+  hardening closed Action publication/finalization, strict-schema, blocker, materialization, and
+  retry-recovery findings; both axes ultimately reported PASS.
+- Final MCP-enabled regression is `199/199 PASS`; wheel/install/stdio and Plugin/Skill/marketplace
+  validation pass. TASK-012 is `ACCEPTED`. Nothing was pushed, published, deployed, or run against
+  a real model Campaign.
 
 ## Deferred
 

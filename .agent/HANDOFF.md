@@ -2,14 +2,13 @@
 
 ## Current objective
 
-AutoDev 4.0 alpha implementation, headless parity, local stdio MCP, and repository plugin are
-implemented. The release documentation and local acceptance slice is complete. TASK-012 remains in
-`REVIEW`: the required independent fixed-point Standards and `v4.md` Spec reviews from
-`v3.0.0a1` have not yet been run and must not be inferred from the test evidence below.
+AutoDev 4.0 alpha is locally accepted. The Codex-native Action workflow, shared headless lifecycle,
+stdio MCP, repository plugin, migration, documentation, and release gates are complete. TASK-012 is
+`ACCEPTED`; there is no pending owner or required implementation work.
 
-The next owner is a fresh Reviewer. Run the two review axes independently, fix any blocking
-findings, rerun focused review and final verification, then decide whether TASK-012 can move from
-`REVIEW` to `ACCEPTED`.
+Independent Standards and `v4.md` Spec reviews used the annotated `v3.0.0a1` fixed point. Their
+blocking findings drove additional strict-schema, read-only identity, human-question,
+materialization, and crash-finalization hardening. Both axes ultimately reported PASS.
 
 ## Accepted V4 behavior
 
@@ -35,21 +34,20 @@ findings, rerun focused review and final verification, then decide whether TASK-
 
 - Fixed point: annotated tag `v3.0.0a1^{}` resolves to
   `ad0e586aab8d38477eec7b3f7c5f3f23795ea2ca`.
-- MCP-enabled isolated environment:
-  `python3 -m unittest discover -s tests -v` — `171/171 PASS` in 29.448 seconds. The suite includes
-  official Python MCP stdio initialization/tool/call tests; it uses Fake/local processes and made no
-  live model call.
-- Focused package tests — `8/8 PASS`; focused V4 migration tests — `4/4 PASS`.
+- MCP-enabled isolated environment: `199/199 PASS`. The suite includes official Python MCP stdio
+  initialization/tool/call tests; it uses Fake/local processes and made no live model call.
+- Focused final gates: Action Protocol `55/55 PASS`, Campaign `15/15 PASS`, Attempt parity `7/7
+  PASS`, official MCP stdio `11/11 PASS`, package `8/8 PASS`, and V4 migration `4/4 PASS`.
 - Wheel `dist/autodev-4.0.0a1-py3-none-any.whl` built successfully with SHA-256
-  `9fd615468488800fa3674cdefdceada0c3d844797edeba9a788301c21bcc3fa6`.
+  `778bdcd16d52e65eadb8615f5296fa330cd376b373f47d797b68ae4f535cd8f8`.
 - A second isolated venv installed that wheel. `autodev version` and `autodev-mcp --version` both
   returned `4.0.0a1`; installed plugin layout plus 12-tool stdio valid/invalid call smoke passed.
 - Plugin validator — PASS; Skill validator — PASS; repository `personal` marketplace structure and
   local source resolution — PASS.
-- `python3 scripts/autodev.py validate` and `git diff --check` — PASS for the completed
-  documentation/state slice. Run them again after any review-driven fix.
-- Push, publication, deployment, remote mutation, real model Campaign, and fixed-point review:
-  NOT RUN.
+- `python3 scripts/autodev.py validate`, compile checks, and `git diff --check` — PASS after the
+  final review-driven fix.
+- Fixed-point Standards review — PASS; fixed-point `v4.md` Spec review — PASS.
+- Push, publication, deployment, remote mutation, and real model Campaign: NOT RUN.
 
 ## Recovery and release notes
 
@@ -65,11 +63,10 @@ findings, rerun focused review and final verification, then decide whether TASK-
 
 ## Preserved user state
 
-- Work began from a clean worktree at local implementation commit `43ea3fb`; no unrelated user
-  files were modified.
+- Work began from clean implementation commit `ad0e586`; no unrelated user files were modified.
 - No tag or commit was pushed. No package/plugin was published or deployed.
 
 ## Next action
 
-Use `v3.0.0a1` as the fixed point and run separate Standards and `v4.md` Spec reviews. Do not mark
-TASK-012 accepted while either axis has a blocking finding or while final validation is missing.
+No required action. Keep the alpha local unless a separate decision authorizes publication or a
+new Campaign defines further product work.

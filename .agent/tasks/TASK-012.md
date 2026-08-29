@@ -4,7 +4,7 @@
 - Quality mode: `HARDENING`
 - Requirements: `REQ-001`, `REQ-043`, `REQ-046`, `REQ-047`, `REQ-049`, `REQ-050`, `REQ-051`, `REQ-053`, `REQ-054`, `REQ-055`, `REQ-056`
 - Milestone: `M11-V4-RELEASE-GATE`
-- Status: `REVIEW`
+- Status: `ACCEPTED`
 
 ## Objective
 
@@ -41,8 +41,8 @@ Document, package, independently review, and accept the complete Codex-native V4
 ## Evidence
 
 - Final command outputs, wheel/plugin contents and hashes, fixed-point review reports, Fake Campaign trace, and updated durable handoff/state.
-- Documentation/package acceptance slice on 2026-08-30: MCP-enabled full suite `171/171 PASS`; wheel SHA-256 `9fd615468488800fa3674cdefdceada0c3d844797edeba9a788301c21bcc3fa6`; isolated wheel install, both entry points, 12-tool stdio/plugin smoke, and Plugin/Skill/marketplace validators PASS.
-- Fixed-point Standards and `v4.md` Spec reviews from `v3.0.0a1` remain pending. This Task must not become `ACCEPTED` until both axes are independently non-blocking and final post-fix verification passes.
+- Final post-review acceptance on 2026-08-30: MCP-enabled full suite `199/199 PASS`; Action Protocol `55/55`, Campaign `15/15`, Attempt parity `7/7`, and official MCP stdio `11/11` PASS. Wheel SHA-256 `778bdcd16d52e65eadb8615f5296fa330cd376b373f47d797b68ae4f535cd8f8`; isolated wheel install, both entry points, 12-tool stdio/plugin smoke, and Plugin/Skill/marketplace validators PASS.
+- Independent Standards and `/home/mint/dev/auto_dev/v4.md` Spec reviews used fixed point `v3.0.0a1`; after review-driven hardening and focused rereview, both axes reported PASS with no blocking finding.
 
 ## Output Contract
 
