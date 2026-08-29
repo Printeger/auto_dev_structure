@@ -157,21 +157,32 @@ class ActionController:
                 }))
                 if reconciled.status != "SUCCESS":
                     return ActionOutcome(reconciled.status, reconciled.message, data=reconciled.data)
-                if action.get("type") == "EXECUTE_TASK":
+                if action.get("type") in {"EXECUTE_TASK", "RUN_IMMEDIATE_REVIEW"}:
                     run_id = str(action.get("context", {}).get("run_id", ""))
                     attempt_path = self._canonical / "runs" / run_id / "action-attempt.json"
                     refreshed = self._read_state()
                     task = refreshed.get("tasks", {}).get(action.get("task_id"), {})
-                    if task.get("status") == "REVIEWING" and attempt_path.is_file():
+                    if (
+                        action.get("type") == "EXECUTE_TASK"
+                        and task.get("status") == "REVIEWING"
+                        and attempt_path.is_file()
+                    ):
                         attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
                         final = self._create_immediate_review(
                             action, Path(action["workspace"]), attempt,
                         )
                     else:
-                        if Path(str(action.get("workspace", ""))).exists():
-                            CampaignWorkspace(
-                                self._root, str(action["campaign_id"]),
-                            ).remove_task_workspace(Path(action["workspace"]))
+                        cleanup = self._safe_cleanup(
+                            str(action["campaign_id"]), Path(str(action["workspace"])),
+                        )
+                        final = cleanup or self.get_next_action(str(action["campaign_id"]))
+                    _write_json_atomic(directory / "outcome.json", self._outcome_dict(final))
+                    return final
+                if action.get("type") == "RUN_PHASE_REVIEW":
+                    gated = CampaignController(self._root).phase_gate(str(action["campaign_id"]))
+                    if gated.status not in {"SUCCESS", "NOT_READY"}:
+                        final = ActionOutcome(gated.status, gated.message, data=gated.data)
+                    else:
                         final = self.get_next_action(str(action["campaign_id"]))
                     _write_json_atomic(directory / "outcome.json", self._outcome_dict(final))
                     return final
@@ -201,16 +212,22 @@ class ActionController:
             revision_is_current or graceful_pause_only or recoverable_processing
         ):
             return ActionOutcome("INVALID", "stale Action revision")
+        task = state.get("tasks", {}).get(action.get("task_id"), {})
+        if (
+            task.get("status") == "ACCEPTED"
+            and action["type"] in {"EXECUTE_TASK", "RUN_IMMEDIATE_REVIEW"}
+        ):
+            return self._recover_accepted_action(action, dict(result))
         if action["type"] == "EXECUTE_TASK":
-            task = state.get("tasks", {}).get(action.get("task_id"), {})
-            if task.get("status") == "ACCEPTED":
-                return self._recover_accepted_worker(action, dict(result))
             return self._submit_worker(action, dict(result))
         if action["type"] == "PLAN_PHASE":
             return self._submit_plan(action, dict(result))
         if action["type"] == "RUN_IMMEDIATE_REVIEW":
             return self._submit_review(action, dict(result))
         if action["type"] == "RUN_PHASE_REVIEW":
+            recovered_phase = self._recover_passed_phase_review(action, dict(result))
+            if recovered_phase is not None:
+                return recovered_phase
             return self._submit_phase_review(action, dict(result))
         if action["type"] == "RUN_DIAGNOSTIC":
             return self._submit_diagnostic(action, dict(result))
@@ -867,7 +884,9 @@ class ActionController:
                 "review": result, "review_attempts": int(flow.get("review_attempts", 0)),
             },
         )
-        CampaignWorkspace(self._root, campaign_id).remove_task_workspace(workspace)
+        cleanup = self._safe_cleanup(campaign_id, workspace)
+        if cleanup is not None:
+            return cleanup
         resolved = self._resolve(
             action, result, ActionOutcome("SUCCESS", f"Phase Review {action['id']} accepted"),
         )
@@ -877,6 +896,47 @@ class ActionController:
         if gated.status not in {"SUCCESS", "NOT_READY"}:
             return ActionOutcome(gated.status, gated.message, data=gated.data)
         final = self.get_next_action(campaign_id)
+        _write_json_atomic(
+            self._canonical / "actions" / action["id"] / "outcome.json",
+            self._outcome_dict(final),
+        )
+        return final
+
+    def _recover_passed_phase_review(
+        self, action: dict[str, Any], result: dict[str, Any],
+    ) -> ActionOutcome | None:
+        campaign_id = str(action["campaign_id"])
+        phase = str(action["phase"])
+        summary_path = self._canonical / "campaigns" / campaign_id / f"phase-summary-{phase}.json"
+        if not summary_path.is_file():
+            return None
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            return ActionOutcome("INFRA_FAILURE", f"passed Phase Review cannot be recovered: {error}")
+        state = self._read_state()
+        campaign = state.get("campaigns", {}).get(campaign_id, {})
+        if (
+            summary.get("status") != "PASSED"
+            or summary.get("phase") != phase
+            or summary.get("checkpoint") != campaign.get("checkpoint")
+        ):
+            return None
+        if summary.get("review") != result:
+            return ActionOutcome("INVALID", "Phase Review result conflicts with canonical summary")
+        cleanup = self._safe_cleanup(campaign_id, Path(action["workspace"]))
+        if cleanup is not None:
+            return cleanup
+        resolved = self._resolve(
+            action, result, ActionOutcome("SUCCESS", f"Phase Review {action['id']} recovered"),
+        )
+        if resolved.status != "SUCCESS":
+            return resolved
+        gated = CampaignController(self._root).phase_gate(campaign_id)
+        if gated.status not in {"SUCCESS", "NOT_READY"}:
+            final = ActionOutcome(gated.status, gated.message, data=gated.data)
+        else:
+            final = self.get_next_action(campaign_id)
         _write_json_atomic(
             self._canonical / "actions" / action["id"] / "outcome.json",
             self._outcome_dict(final),
@@ -910,6 +970,7 @@ class ActionController:
             return ActionOutcome("INFRA_FAILURE", f"checkpoint failed: {error}")
         evidence_id = self._write_evidence(
             action, result, patch, changed_paths, validations, checkpoint.commit,
+            action_result=submitted_result or result,
         )
         finished = self._control.execute(Command("run.finish", {
             "run_id": run_id, "outcome": result["outcome"], "evidence_id": evidence_id,
@@ -939,10 +1000,10 @@ class ActionController:
         )
         return final
 
-    def _recover_accepted_worker(
+    def _recover_accepted_action(
         self, action: dict[str, Any], result: dict[str, Any],
     ) -> ActionOutcome:
-        """Finish publication after acceptance crossed the durable run boundary."""
+        """Finish any Action publication after crossing durable run acceptance."""
 
         run_id = str(action["context"]["run_id"])
         try:
@@ -955,10 +1016,10 @@ class ActionController:
         task = state.get("tasks", {}).get(action.get("task_id"), {})
         if (
             evidence.get("action_id") != action["id"]
-            or evidence.get("result_hash") != _hash(result)
+            or evidence.get("action_result_hash", evidence.get("result_hash")) != _hash(result)
             or evidence.get("evidence_id") not in task.get("evidence_ids", [])
         ):
-            return ActionOutcome("INFRA_FAILURE", "accepted Action evidence is inconsistent")
+            return ActionOutcome("INVALID", "accepted Action result conflicts with canonical evidence")
         cleanup = self._safe_cleanup(str(action["campaign_id"]), Path(action["workspace"]))
         if cleanup is not None:
             return cleanup
@@ -1027,12 +1088,14 @@ class ActionController:
     def _write_evidence(
         self, action: Mapping[str, Any], result: Mapping[str, Any], patch: bytes,
         changed_paths: list[str], validations: list[dict[str, Any]], checkpoint: str | None,
+        *, action_result: Mapping[str, Any] | None = None,
     ) -> str:
         run_id = str(action["context"]["run_id"])
         evidence = {
             "task_id": action["task_id"], "run_id": run_id,
             "outcome": result["outcome"], "created_at": _now(),
             "action_id": action["id"], "result_hash": _hash(result),
+            "action_result_hash": _hash(action_result or result),
             "diff_hash": _hash(patch), "changed_paths": changed_paths,
             "validations": [
                 {"argv": item["argv"], "returncode": item["returncode"],
