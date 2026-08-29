@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "autodev": {
+      "command": "autodev-mcp",
+      "args": ["--stdio"]
+    }
+  }
+}

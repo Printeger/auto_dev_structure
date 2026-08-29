@@ -1,0 +1,6 @@
+interface:
+  display_name: "AutoDev"
+  short_description: "Run a Core-controlled development Campaign"
+  default_prompt: "Use $autodev to develop this project through a confirmed Campaign."
+policy:
+  allow_implicit_invocation: false

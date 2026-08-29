@@ -1,0 +1,19 @@
+{
+  "name": "autodev",
+  "version": "4.0.0-alpha.1",
+  "description": "Run Core-controlled AutoDev Campaigns from the current Codex session.",
+  "author": {
+    "name": "AutoDev maintainers"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Autodev",
+    "shortDescription": "Run a Core-controlled development Campaign.",
+    "longDescription": "AutoDev connects one explicit Codex skill to a local stdio MCP and canonical Core Action protocol.",
+    "developerName": "AutoDev maintainers",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Use $autodev to develop this project through a confirmed Campaign."
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -15,7 +15,7 @@ sys.path.insert(0, str(SOURCE_ROOT / "src"))
 from autodev import __version__
 from autodev._resources import _read_text, _resource_manifest
 from autodev.cli import main
-from autodev.mcp_server import main as mcp_main
+from autodev.mcp_server import TOOL_NAMES, main as mcp_main
 
 
 class PackageFoundationTests(unittest.TestCase):
@@ -39,18 +39,15 @@ class PackageFoundationTests(unittest.TestCase):
             "autodev.mcp_server:main",
         )
 
-    def test_mcp_entry_point_is_importable_and_fail_closed_until_implemented(self) -> None:
+    def test_mcp_entry_point_is_importable_and_declares_the_v4_tools(self) -> None:
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             result = mcp_main(["--version"])
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue(), "4.0.0a1\n")
 
-        error = io.StringIO()
-        with contextlib.redirect_stderr(error):
-            result = mcp_main(["--stdio"])
-        self.assertEqual(result, 2)
-        self.assertIn("not available until the V4 MCP slice", error.getvalue())
+        self.assertEqual(len(TOOL_NAMES), 12)
+        self.assertEqual(len(set(TOOL_NAMES)), 12)
 
     def test_manifest_resources_are_loadable(self) -> None:
         manifest = _resource_manifest()

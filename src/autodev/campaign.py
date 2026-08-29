@@ -210,10 +210,36 @@ class CampaignController:
                     {"request_id": error.pending.request_id, "artifact": str(error.pending.artifact_path)},
                 )
             return CampaignOutcome("INFRA_FAILURE", f"Planner failed: {error}", campaign_id)
+        return self.propose_structured(request, proposal, campaign_id=campaign_id)
+
+    def propose_structured(
+        self,
+        request: CampaignRequest,
+        proposal: Mapping[str, Any],
+        *,
+        campaign_id: str | None = None,
+    ) -> CampaignOutcome:
+        """Validate and persist a Commander-supplied Campaign proposal.
+
+        This is the planner-free Core entry point used by the Codex-native MCP
+        surface.  It deliberately accepts data, not a Planner implementation, so
+        invoking it cannot start App Server or a Codex subprocess.
+        """
+
+        if not request.idea.strip():
+            return CampaignOutcome("INVALID", "Campaign idea must be non-empty")
+        if request.mode not in {"CHANGE", "STAGED", "CRITICAL"}:
+            return CampaignOutcome("INVALID", "mode must be CHANGE, STAGED, or CRITICAL")
+        try:
+            phases = self._phases(request.mode, request.target)
+        except ValueError as error:
+            return CampaignOutcome("INVALID", str(error))
+        campaign_id = campaign_id or self._next_campaign_id()
+        proposal = dict(proposal)
         schema = json.loads(_read_text("schemas/campaign-proposal.schema.json"))
         proposal_errors = sorted(error.message for error in Draft202012Validator(schema).iter_errors(proposal))
         if proposal_errors:
-            return CampaignOutcome("INVALID", "Planner returned an invalid Campaign proposal", campaign_id, {"errors": proposal_errors})
+            return CampaignOutcome("INVALID", "invalid Campaign proposal", campaign_id, {"errors": proposal_errors})
         requirements = {
             "$schema": "https://autodev.local/schemas/requirements.schema.json",
             "schema_version": 1,
@@ -222,7 +248,7 @@ class CampaignController:
         }
         authority = {**default_authority_envelope(), **proposal.get("authority_envelope", {})}
         if proposal["phase"] != phases[0]:
-            return CampaignOutcome("INVALID", "Planner proposed the wrong initial phase", campaign_id)
+            return CampaignOutcome("INVALID", "proposal has the wrong initial phase", campaign_id)
         proposed_at = _now()
         frozen = {
             "idea": request.idea.strip(), "mode": request.mode, "target": request.target,
