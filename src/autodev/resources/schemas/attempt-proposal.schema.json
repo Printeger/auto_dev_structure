@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/attempt-proposal.schema.json",
+  "title": "AutoDev structured attempt proposal",
+  "type": "object",
+  "required": ["outcome", "summary", "blocker", "next_action", "findings", "debt_items"],
+  "properties": {
+    "outcome": {"enum": ["PASS", "PASS_WITH_DEBT", "REWORK", "BLOCKED"]},
+    "summary": {"type": "string", "minLength": 1},
+    "blocker": {"type": ["string", "null"]},
+    "next_action": {"type": ["string", "null"]},
+    "findings": {"type": "array", "items": {"type": "string"}},
+    "debt_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "source_task", "reason", "severity", "module", "fix_before", "classification"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "source_task": {"type": "string", "pattern": "^TASK-[0-9]{3,}$"},
+          "reason": {"type": "string", "minLength": 1},
+          "severity": {"enum": ["LOW", "MEDIUM"]},
+          "module": {"type": "string", "minLength": 1},
+          "fix_before": {"type": "string", "minLength": 1},
+          "classification": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

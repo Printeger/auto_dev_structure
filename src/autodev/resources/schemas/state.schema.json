@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/state.schema.json",
+  "title": "AutoDev canonical project state",
+  "$defs": {
+    "nullableString": {"type": ["string", "null"]},
+    "taskRecord": {
+      "type": "object",
+      "required": ["status", "generation", "contract_hash", "claim_id", "evidence_ids", "blocking", "requirement_ids", "created_at", "updated_at"],
+      "properties": {
+        "status": {"enum": ["DRAFT", "READY", "CLAIMED", "RUNNING", "VALIDATING", "REVIEWING", "ACCEPTED", "DEFERRED", "BLOCKED", "CANCELLED"]},
+        "generation": {"type": "integer", "minimum": 1},
+        "contract_hash": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "claim_id": {"type": ["string", "null"]},
+        "evidence_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "blocking": {"type": "boolean"},
+        "requirement_ids": {"type": "array", "items": {"type": "string", "pattern": "^REQ-[0-9]{3,}$"}, "uniqueItems": true},
+        "created_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.+(?:Z|[+-][0-9]{2}:[0-9]{2})$"},
+        "updated_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.+(?:Z|[+-][0-9]{2}:[0-9]{2})$"}
+      },
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": ["$schema", "schema_version", "framework_version", "revision", "project_status", "current_milestone", "current_task_id", "current_run_id", "last_outcome", "last_checkpoint", "blocker", "next_owner", "next_action", "tasks", "accepted_requirement_ids", "blocking_debt_ids", "full_validation_passed", "active_lock", "updated_at"],
+  "properties": {
+    "$schema": {"const": "https://autodev.local/schemas/state.schema.json"},
+    "schema_version": {"const": 1},
+    "framework_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:a[0-9]+)?$"},
+    "revision": {"type": "integer", "minimum": 0},
+    "project_status": {"enum": ["BOOTSTRAP", "ACTIVE", "PAUSED", "BLOCKED", "COMPLETE", "FAILED", "STOPPED"]},
+    "current_milestone": {"$ref": "#/$defs/nullableString"},
+    "current_task_id": {"type": ["string", "null"], "pattern": "^TASK-[0-9]{3,}$"},
+    "current_run_id": {"$ref": "#/$defs/nullableString"},
+    "last_outcome": {"type": ["string", "null"]},
+    "last_checkpoint": {"$ref": "#/$defs/nullableString"},
+    "blocker": {"$ref": "#/$defs/nullableString"},
+    "next_owner": {"enum": ["COMMANDER", "HUMAN", "NONE"]},
+    "next_action": {"type": ["string", "null"]},
+    "tasks": {"type": "object", "propertyNames": {"pattern": "^TASK-[0-9]{3,}$"}, "additionalProperties": {"$ref": "#/$defs/taskRecord"}},
+    "accepted_requirement_ids": {"type": "array", "items": {"type": "string", "pattern": "^REQ-[0-9]{3,}$"}, "uniqueItems": true},
+    "blocking_debt_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "full_validation_passed": {"type": "boolean"},
+    "active_lock": {"$ref": "#/$defs/nullableString"},
+    "updated_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.+(?:Z|[+-][0-9]{2}:[0-9]{2})$"}
+  },
+  "additionalProperties": false
+}

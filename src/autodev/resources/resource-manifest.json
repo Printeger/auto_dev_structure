@@ -1,0 +1,23 @@
+{
+  "$schema": "./schemas/resource-manifest.schema.json",
+  "framework_version": "2.0.0a1",
+  "schemas": [
+    "schemas/resource-manifest.schema.json",
+    "schemas/manifest.schema.json",
+    "schemas/config.schema.json",
+    "schemas/policy.schema.json",
+    "schemas/state.schema.json",
+    "schemas/task-contract.schema.json",
+    "schemas/attempt-outcome.schema.json",
+    "schemas/attempt-proposal.schema.json",
+    "schemas/event.schema.json",
+    "schemas/command-result.schema.json",
+    "schemas/agent-proposal.schema.json"
+  ],
+  "migration_manifests": [
+    "v1-checksums.json"
+  ],
+  "templates": [
+    "templates/.codex/agents/autodev-builder.toml"
+  ]
+}

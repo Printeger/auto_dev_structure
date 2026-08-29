@@ -1,0 +1,12 @@
+{
+  "framework_version": "1",
+  "files": {
+    ".codex/agents/builder.toml": "6dad91cbb71ac925857171385fa4ab30a873e08d214e02b1dbd949638df4fd55",
+    ".codex/agents/explorer.toml": "9542ed81806e30062adb4bee9a035cb72f7ddccf86cf347b3216dbbcfda9910c",
+    ".codex/agents/reviewer.toml": "455fff176bd1208f8082425cc5131c93b58f5a6862178488be23b6aee6f74a30",
+    ".codex/hooks.example.json": "06466e212a1cce1f045609070f7cb58b9aec5aa4e7b0839b715b9c49ac33c9f0",
+    "scripts/autodev.py": "26d948cabe6aaed4433778765813ddf31f3bf9058d76c69c25e76e3dc6c3b8d2",
+    "scripts/hooks/stop_validate.py": "cc3fd3bb31b54fc3a63e8048f909fba007ce2b340f0c0f923e62b740abd5e28e",
+    "tests/test_autodev.py": "fe1dc44b787383c23a2c53d38a11bbb444fa71827e915e9e7fa1d9973a526d9c"
+  }
+}

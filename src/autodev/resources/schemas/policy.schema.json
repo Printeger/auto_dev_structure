@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/policy.schema.json",
+  "title": "AutoDev execution policy",
+  "type": "object",
+  "required": ["$schema", "schema_version", "validation"],
+  "properties": {
+    "$schema": {"const": "https://autodev.local/schemas/policy.schema.json"},
+    "schema_version": {"const": 1},
+    "validation": {
+      "type": "object",
+      "required": ["allowed_executables", "allowed_cwds"],
+      "properties": {
+        "allowed_executables": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[A-Za-z0-9_.+-]+$"}
+        },
+        "allowed_cwds": {
+          "type": "array", "minItems": 1, "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^(?:\\.|(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[A-Za-z0-9_.+/-]+)$"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["mode", "build_permission_profile", "review_permission_profile"],
+      "properties": {
+        "mode": {"enum": ["codex-sandbox", "external-sandbox"]},
+        "build_permission_profile": {"type": "string", "minLength": 1},
+        "review_permission_profile": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "runner": {
+      "type": "object",
+      "properties": {
+        "max_iterations": {"type": "integer", "minimum": 1},
+        "max_seconds": {"type": "integer", "minimum": 1},
+        "max_work_attempts": {"type": "integer", "minimum": 1},
+        "max_reworks": {"type": "integer", "minimum": 0},
+        "max_stagnation": {"type": "integer", "minimum": 1},
+        "idle_timeout": {"type": "integer", "minimum": 1},
+        "hard_timeout": {"type": "integer", "minimum": 1},
+        "infrastructure_retries": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "protected_paths": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": false
+}

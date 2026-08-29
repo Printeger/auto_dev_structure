@@ -1,0 +1,48 @@
+{
+  "baseline_head": "c5c56e344441ca0e2c5ccd92e9465b93af2fbda5",
+  "builder_attempts": 1,
+  "changed_paths": [
+    "greeting.py"
+  ],
+  "codex_version": "codex-cli 0.144.5",
+  "completion_created_attempt": false,
+  "evidence": {
+    "checkpoint_id": "acda75228282fd297d15ae348a6c33159c09206b753acaa2307185364062a40b",
+    "contract_hash": "3c3806ede97b42552f9b9ca06cfcf2acf4492f8a0e8e6637835e0da99e6f82d0",
+    "diff_hash": "acda75228282fd297d15ae348a6c33159c09206b753acaa2307185364062a40b",
+    "evidence_id": "EVIDENCE-dbdff7efb3eb1e365ab9e56b7a3081058504c51c1a56ca59ecd9ac2947001c22",
+    "proposal_hash": "f7a0fb26dba4724fe3e84d21d86547fd11f7035bac72885cabb5e2a7ac258579",
+    "review_hash": null,
+    "validations": [
+      {
+        "argv": [
+          "python3",
+          "-m",
+          "unittest",
+          "-v"
+        ],
+        "log_hash": "c6426b918cf57ef17d1c67c43e4064e73676921ecac71615c803932175be6234",
+        "returncode": 0,
+        "timed_out": false
+      }
+    ]
+  },
+  "example": "build-low-greeting",
+  "framework_version": "2.0.0a1",
+  "live_authorization": "AUTODEV_LIVE_CODEX=1",
+  "project_status": "COMPLETE",
+  "reviewer_attempts": 0,
+  "run_exit_code": 0,
+  "runtime_mode": ":workspace via Codex sandbox",
+  "task_status": "ACCEPTED",
+  "validation": {
+    "argv": [
+      "python3",
+      "-m",
+      "unittest",
+      "-v"
+    ],
+    "output_sha256": "64cbf5fd688aded75743e1168a0189c34ca01131852e4cf803a9288cfbb50f51",
+    "returncode": 0
+  }
+}

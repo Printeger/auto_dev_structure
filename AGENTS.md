@@ -4,7 +4,9 @@ This repository uses persisted project state and short-lived specialist agents. 
 
 ## Commander authority
 
-The primary agent is Commander. It owns task selection, scope, delegation, risk routing, acceptance, state transitions, checkpoints, and human escalation. It may update workflow documents and `.agent/` state. It must not claim acceptance without evidence.
+In an interactive development session, the primary agent is Commander. It owns task selection, scope, delegation, risk routing, acceptance, state transitions, checkpoints, and human escalation. It may update workflow documents and `.agent/` state. It must not claim acceptance without evidence.
+
+In an automated AutoDev run, the durable AutoDev control plane holds that Commander authority. For a fresh BUILD + LOW/MEDIUM attempt, the primary Codex execution acts directly as the sole restricted Builder; path policy, deterministic validation, evidence, and state transitions remain control-plane gates. Higher-risk routes use a separate fresh Reviewer as specified below.
 
 Builder is the only specialist role allowed to edit implementation files. Use at most one Builder at a time. Explorer and Reviewer are read-only. Commander may make small workflow/state corrections but delegates product implementation to Builder.
 
@@ -38,9 +40,11 @@ Store durable decisions as individual ADRs under `docs/decisions/`. Keep `docs/D
 
 ## Delegation and reports
 
-Use Explorer for bounded read-only discovery. Give Builder exactly one Task contract plus relevant inputs. Builder must test and self-review, then return: `STATUS`, `FILES_CHANGED`, `TEST_RESULTS`, `ACCEPTANCE_EVIDENCE`, `RISKS`, `STATE_UPDATE_PROPOSAL`.
+Use Explorer for bounded read-only discovery. Give Builder exactly one Task contract plus relevant inputs. An interactively delegated Builder must test and self-review, then return: `STATUS`, `FILES_CHANGED`, `TEST_RESULTS`, `ACCEPTANCE_EVIDENCE`, `RISKS`, `STATE_UPDATE_PROPOSAL`.
 
-Reviewer receives only the Task, diff, test evidence, and relevant contracts/interfaces—not Builder reasoning history. Reviewer returns findings ordered by severity, acceptance result, missing evidence, and `PASS | PASS_WITH_DEBT | REWORK | BLOCKED`.
+An automated Engine Builder instead returns the packaged strict attempt proposal. AutoDev independently derives changed files, validation results, acceptance evidence, risks/debt eligibility, checkpoint data, and the canonical state transition; an agent proposal never substitutes for those gates.
+
+Reviewer receives only the Task, requirement signals, diff, test evidence, and relevant contracts/interfaces—not Builder reasoning history. Interactive Reviewer reports order findings by severity and name missing evidence. Automated Reviewer encodes the acceptance result as `PASS | PASS_WITH_DEBT | REWORK | BLOCKED`, with ordered findings and missing evidence represented in its strict proposal.
 
 ## Quality and risk routing
 

@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/task-contract.schema.json",
+  "title": "AutoDev Task contract",
+  "$defs": {
+    "relativePath": {"type": "string", "pattern": "^(?:\\.|(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\u0000]+)$"}
+  },
+  "type": "object",
+  "required": ["$schema", "schema_version", "id", "title", "objective", "requirements", "dependencies", "priority", "blocking", "risk", "quality_mode", "change_classes", "allowed_paths", "out_of_scope", "acceptance_criteria", "validation_commands", "prohibited_actions", "created_at"],
+  "properties": {
+    "$schema": {"const": "https://autodev.local/schemas/task-contract.schema.json"},
+    "schema_version": {"const": 1},
+    "id": {"type": "string", "pattern": "^TASK-[0-9]{3,}$"},
+    "title": {"type": "string"},
+    "objective": {"type": "string"},
+    "requirements": {"type": "array", "items": {"type": "string", "pattern": "^REQ-[0-9]{3,}$"}, "uniqueItems": true},
+    "dependencies": {"type": "array", "items": {"type": "string", "pattern": "^TASK-[0-9]{3,}$"}, "uniqueItems": true},
+    "priority": {"enum": ["MUST", "SHOULD", "COULD"]},
+    "blocking": {"type": "boolean"},
+    "risk": {"enum": ["LOW", "MEDIUM", "HIGH"]},
+    "quality_mode": {"enum": ["BUILD", "INTEGRATION", "HARDENING"]},
+    "change_classes": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "allowed_paths": {"type": "array", "items": {"$ref": "#/$defs/relativePath"}, "uniqueItems": true},
+    "out_of_scope": {"type": "array", "items": {"type": "string"}},
+    "acceptance_criteria": {
+      "type": "array", "uniqueItems": true,
+      "items": {
+        "type": "object", "required": ["id", "description"],
+        "properties": {"id": {"type": "string", "pattern": "^AC-[0-9]{3,}$"}, "description": {"type": "string"}},
+        "additionalProperties": false
+      }
+    },
+    "validation_commands": {
+      "type": "array",
+      "items": {
+        "type": "object", "required": ["argv", "cwd", "timeout"],
+        "properties": {
+          "argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "cwd": {"$ref": "#/$defs/relativePath"},
+          "timeout": {"type": "integer", "minimum": 1, "maximum": 86400}
+        },
+        "additionalProperties": false
+      }
+    },
+    "prohibited_actions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "created_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.+(?:Z|[+-][0-9]{2}:[0-9]{2})$"}
+  },
+  "additionalProperties": false
+}

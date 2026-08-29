@@ -320,6 +320,29 @@ def _template_sources() -> tuple[list[tuple[str, Path]], list[str]]:
     return sources, missing
 
 
+def _initialized_state(source: Path, project_name: str) -> str:
+    """Create a clean V1 bootstrap state instead of copying this repository's live state."""
+
+    raw = json.loads(source.read_text(encoding="utf-8"))
+    raw.update(
+        project_name=project_name,
+        project_status="BOOTSTRAP",
+        quality_mode="BUILD",
+        phase="IDLE",
+        last_outcome=None,
+        current_milestone=None,
+        current_task_id=None,
+        last_good_commit=None,
+        agent_calls=0,
+        rework_count=0,
+        blocker=None,
+        next_action="Complete required project contracts, then run validate --ready.",
+        next_owner="COMMANDER",
+        updated_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+    )
+    return _json_dump(raw) + "\n"
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     name = args.name.strip()
     if not name or "\n" in name or "\r" in name:
@@ -351,7 +374,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         if destination.exists():
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
-        content = source.read_text(encoding="utf-8").replace("{{PROJECT_NAME}}", name)
+        if relative == ".agent/STATE.json":
+            content = _initialized_state(source, name)
+        else:
+            content = source.read_text(encoding="utf-8").replace("{{PROJECT_NAME}}", name)
+            if relative == "README.md" and name not in content:
+                content = f"<!-- Initialized project: {name} -->\n" + content
         destination.write_text(content, encoding="utf-8")
         shutil.copymode(source, destination)
         copied.append(relative)

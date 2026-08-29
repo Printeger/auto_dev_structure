@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/event.schema.json",
+  "title": "AutoDev canonical mutation event",
+  "type": "object",
+  "required": ["$schema", "schema_version", "revision", "previous_revision", "command", "occurred_at", "payload"],
+  "properties": {
+    "$schema": {"const": "https://autodev.local/schemas/event.schema.json"},
+    "schema_version": {"const": 1},
+    "revision": {"type": "integer", "minimum": 1},
+    "previous_revision": {"type": "integer", "minimum": 0},
+    "command": {"type": "string", "minLength": 1},
+    "occurred_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.+(?:Z|[+-][0-9]{2}:[0-9]{2})$"},
+    "payload": {"type": "object"}
+  },
+  "additionalProperties": false
+}
