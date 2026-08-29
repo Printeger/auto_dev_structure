@@ -1,6 +1,6 @@
 {
   "$schema": "./schemas/resource-manifest.schema.json",
-  "framework_version": "2.0.0a1",
+  "framework_version": "3.0.0a1",
   "schemas": [
     "schemas/resource-manifest.schema.json",
     "schemas/manifest.schema.json",
@@ -16,6 +16,12 @@
   ],
   "migration_manifests": [
     "v1-checksums.json"
+  ],
+  "campaign_schemas": [
+    "schemas/requirements.schema.json",
+    "schemas/campaign.schema.json",
+    "schemas/campaign-proposal.schema.json",
+    "schemas/human-request.schema.json"
   ],
   "templates": [
     "templates/.codex/agents/autodev-builder.toml"

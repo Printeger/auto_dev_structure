@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/requirements.schema.json",
+  "title": "AutoDev campaign requirement baseline",
+  "type": "object",
+  "required": ["$schema", "schema_version", "campaign_id", "requirements"],
+  "properties": {
+    "$schema": {"const": "https://autodev.local/schemas/requirements.schema.json"},
+    "schema_version": {"const": 1},
+    "campaign_id": {"type": "string", "pattern": "^CAMP-[0-9]{3,}$"},
+    "requirements": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "priority", "statement", "acceptance_signal"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^REQ-[0-9]{3,}$"},
+          "priority": {"enum": ["MUST", "SHOULD", "COULD"]},
+          "statement": {"type": "string", "minLength": 1},
+          "acceptance_signal": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

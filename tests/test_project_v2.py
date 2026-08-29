@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -87,6 +88,11 @@ class MigrationTests(unittest.TestCase):
             self.assertTrue(next(root.glob(".agent.v1-frozen-*")))
             self.assertEqual(ControlPlane(root).execute(Command("validate")).status, "SUCCESS")
             self.assertTrue((root / ".autodev/tasks/TASK-001/contract.json").is_file())
+            state = json.loads((root / ".autodev/state.json").read_text())
+            self.assertEqual(state["campaigns"]["CAMP-001"]["mode"], "CHANGE")
+            contract = json.loads((root / ".autodev/tasks/TASK-001/contract.json").read_text())
+            self.assertEqual(contract["campaign_id"], "CAMP-001")
+            self.assertEqual(contract["admission"], "HUMAN_APPROVED")
             self.assertEqual(json.loads((root / ".autodev/debt.json").read_text())["items"][0]["id"], "DEBT-001")
 
             rolled_back = rollback_migration(root, migration_id)
@@ -118,6 +124,35 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(report.status, "BLOCKED")
             self.assertIn("scripts/autodev.py", report.data["modified_framework_conflicts"])
             self.assertFalse((root / ".autodev").exists())
+
+    def test_git_backed_v1_migration_creates_a_runnable_private_campaign_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._legacy(root)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "legacy"], cwd=root, check=True)
+
+            applied = apply_migration(root)
+            self.assertEqual(applied.status, "SUCCESS", applied)
+            checkpoint = applied.data["checkpoint"]
+            self.assertTrue(checkpoint)
+            ref = subprocess.run(
+                ["git", "rev-parse", "refs/autodev/campaigns/CAMP-001/current"],
+                cwd=root, check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            self.assertEqual(ref, checkpoint)
+            state = json.loads((root / ".autodev/state.json").read_text())
+            self.assertEqual(state["campaigns"]["CAMP-001"]["checkpoint"], checkpoint)
+            rolled_back = rollback_migration(root, applied.data["migration_id"])
+            self.assertEqual(rolled_back.status, "SUCCESS", rolled_back)
+            missing = subprocess.run(
+                ["git", "show-ref", "--verify", "refs/autodev/campaigns/CAMP-001/current"],
+                cwd=root, capture_output=True,
+            )
+            self.assertNotEqual(missing.returncode, 0)
 
 
 if __name__ == "__main__":

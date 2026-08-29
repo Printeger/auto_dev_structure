@@ -23,6 +23,11 @@
       "items": {"type": "string", "minLength": 1},
       "uniqueItems": true
     },
+    "campaign_schemas": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
     "templates": {
       "type": "array",
       "items": {"type": "string", "minLength": 1},

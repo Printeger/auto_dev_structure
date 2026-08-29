@@ -28,7 +28,7 @@
     "schema_version": {"const": 1},
     "framework_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:a[0-9]+)?$"},
     "revision": {"type": "integer", "minimum": 0},
-    "project_status": {"enum": ["BOOTSTRAP", "ACTIVE", "PAUSED", "BLOCKED", "COMPLETE", "FAILED", "STOPPED"]},
+    "project_status": {"enum": ["BOOTSTRAP", "IDLE", "ACTIVE", "PAUSED", "BLOCKED", "COMPLETE", "FAILED", "STOPPED"]},
     "current_milestone": {"$ref": "#/$defs/nullableString"},
     "current_task_id": {"type": ["string", "null"], "pattern": "^TASK-[0-9]{3,}$"},
     "current_run_id": {"$ref": "#/$defs/nullableString"},
@@ -42,7 +42,28 @@
     "blocking_debt_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
     "full_validation_passed": {"type": "boolean"},
     "active_lock": {"$ref": "#/$defs/nullableString"},
-    "updated_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.+(?:Z|[+-][0-9]{2}:[0-9]{2})$"}
+    "updated_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.+(?:Z|[+-][0-9]{2}:[0-9]{2})$"},
+    "current_campaign_id": {"type": ["string", "null"], "pattern": "^CAMP-[0-9]{3,}$"},
+    "campaigns": {
+      "type": "object",
+      "propertyNames": {"pattern": "^CAMP-[0-9]{3,}$"},
+      "additionalProperties": {
+        "type": "object",
+        "required": ["status", "phase", "mode", "target", "proposal_hash", "checkpoint", "last_materialized_checkpoint", "approved_at"],
+        "properties": {
+          "status": {"enum": ["PROPOSED", "ACTIVE", "WAITING_FOR_HUMAN", "TARGET_REACHED", "ARCHIVED", "CANCELLED"]},
+          "phase": {"enum": ["SCAFFOLD", "IMPLEMENT", "COMPONENT_VERIFY", "INTEGRATE", "HARDEN", "TARGET_REACHED"]},
+          "mode": {"enum": ["CHANGE", "STAGED", "CRITICAL"]},
+          "target": {"enum": ["CHANGE_COMPLETE", "ARCHITECTURE_BASELINE", "WORKING_MVP", "INTEGRATED_SYSTEM", "RELEASE_CANDIDATE"]},
+          "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "checkpoint": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
+          "last_materialized_checkpoint": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
+          "approved_at": {"type": ["string", "null"], "format": "date-time"}
+        },
+        "additionalProperties": false
+      }
+    }
   },
+  "dependentRequired": {"campaigns": ["current_campaign_id"]},
   "additionalProperties": false
 }

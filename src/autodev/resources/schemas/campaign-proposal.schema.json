@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/campaign-proposal.schema.json",
+  "title": "AutoDev strict Planner Campaign proposal",
+  "$defs": {
+    "requirement": {
+      "type": "object",
+      "required": ["id", "priority", "statement", "acceptance_signal"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^REQ-[0-9]{3,}$"},
+        "priority": {"enum": ["MUST", "SHOULD", "COULD"]},
+        "statement": {"type": "string", "minLength": 1},
+        "acceptance_signal": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "option": {
+      "type": "object", "required": ["label", "description"],
+      "properties": {
+        "label": {"type": "string", "minLength": 1},
+        "description": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "question": {
+      "type": "object", "required": ["id", "header", "question", "options", "isOther", "isSecret"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "header": {"type": "string", "minLength": 1, "maxLength": 12},
+        "question": {"type": "string", "minLength": 1},
+        "options": {"type": "array", "minItems": 2, "maxItems": 3, "items": {"$ref": "#/$defs/option"}},
+        "isOther": {"type": "boolean"},
+        "isSecret": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "task": {
+      "type": "object",
+      "required": ["id", "title", "objective", "requirements", "dependencies", "priority", "blocking", "risk", "quality_mode", "change_classes", "allowed_paths", "out_of_scope", "acceptance_criteria", "validation_commands", "prohibited_actions"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^TASK-[0-9]{3,}$"},
+        "title": {"type": "string", "minLength": 1},
+        "objective": {"type": "string", "minLength": 1},
+        "requirements": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^REQ-[0-9]{3,}$"}},
+        "dependencies": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^TASK-[0-9]{3,}$"}},
+        "priority": {"enum": ["MUST", "SHOULD", "COULD"]},
+        "blocking": {"type": "boolean"},
+        "risk": {"enum": ["LOW", "MEDIUM", "HIGH"]},
+        "quality_mode": {"enum": ["BUILD", "INTEGRATION", "HARDENING"]},
+        "change_classes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "allowed_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "out_of_scope": {"type": "array", "items": {"type": "string"}},
+        "acceptance_criteria": {"type": "array", "minItems": 1, "items": {
+          "type": "object", "required": ["id", "description"],
+          "properties": {
+            "id": {"type": "string", "pattern": "^AC-[0-9]{3,}$"},
+            "description": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        }},
+        "validation_commands": {"type": "array", "minItems": 1, "items": {
+          "type": "object", "required": ["argv", "cwd", "timeout"],
+          "properties": {
+            "argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+            "cwd": {"type": "string", "minLength": 1},
+            "timeout": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        }},
+        "prohibited_actions": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "type": "object",
+  "required": ["requirements", "authority_envelope", "phase", "tasks", "questions"],
+  "properties": {
+    "requirements": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/requirement"}},
+    "authority_envelope": {
+      "type": "object",
+      "required": ["max_task_risk", "allowed_change_classes", "dependency_policy", "public_api_changes", "security_changes", "data_migration", "permission_expansion", "remote_actions"],
+      "properties": {
+        "max_task_risk": {"enum": ["LOW", "MEDIUM", "HIGH"]},
+        "allowed_change_classes": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "dependency_policy": {"enum": ["existing-only", "allow-new"]},
+        "public_api_changes": {"enum": ["allow", "require-human", "forbidden"]},
+        "security_changes": {"enum": ["allow", "require-human", "forbidden"]},
+        "data_migration": {"enum": ["allow", "require-human", "forbidden"]},
+        "permission_expansion": {"enum": ["allow", "require-human", "forbidden"]},
+        "remote_actions": {"enum": ["require-human", "forbidden"]}
+      },
+      "additionalProperties": false
+    },
+    "phase": {"enum": ["SCAFFOLD", "IMPLEMENT", "COMPONENT_VERIFY", "INTEGRATE", "HARDEN"]},
+    "tasks": {"type": "array", "items": {"$ref": "#/$defs/task"}},
+    "questions": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/question"}}
+  },
+  "additionalProperties": false
+}

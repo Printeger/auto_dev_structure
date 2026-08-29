@@ -28,7 +28,8 @@ class PackageFoundationTests(unittest.TestCase):
         manifest = _resource_manifest()
         self.assertEqual(manifest["framework_version"], __version__)
         for relative in [
-            *manifest["schemas"], *manifest["templates"], *manifest.get("migration_manifests", [])
+            *manifest["schemas"], *manifest.get("campaign_schemas", []),
+            *manifest["templates"], *manifest.get("migration_manifests", [])
         ]:
             self.assertTrue(_read_text(relative))
 
@@ -50,6 +51,22 @@ class PackageFoundationTests(unittest.TestCase):
         debt_item = schema["properties"]["debt_items"]["items"]
         self.assertFalse(debt_item["additionalProperties"])
         self.assertEqual(set(debt_item["required"]), set(debt_item["properties"]))
+
+    def test_campaign_proposal_uses_codex_strict_object_shapes(self) -> None:
+        schema = json.loads(_read_text("schemas/campaign-proposal.schema.json"))
+
+        def assert_strict(value: object) -> None:
+            if isinstance(value, dict):
+                if value.get("type") == "object" and "properties" in value:
+                    self.assertFalse(value.get("additionalProperties", True))
+                    self.assertEqual(set(value.get("required", [])), set(value["properties"]))
+                for child in value.values():
+                    assert_strict(child)
+            elif isinstance(value, list):
+                for child in value:
+                    assert_strict(child)
+
+        assert_strict(schema)
 
 
 if __name__ == "__main__":

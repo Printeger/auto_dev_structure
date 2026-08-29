@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/campaign.schema.json",
+  "title": "AutoDev frozen campaign contract",
+  "$defs": {
+    "phase": {"enum": ["SCAFFOLD", "IMPLEMENT", "COMPONENT_VERIFY", "INTEGRATE", "HARDEN", "TARGET_REACHED"]}
+  },
+  "type": "object",
+  "required": ["$schema", "schema_version", "id", "idea", "mode", "target", "autonomy", "requirements_hash", "authority_envelope", "phases", "proposal_hash", "proposed_at", "approved_at"],
+  "properties": {
+    "$schema": {"const": "https://autodev.local/schemas/campaign.schema.json"},
+    "schema_version": {"const": 1},
+    "id": {"type": "string", "pattern": "^CAMP-[0-9]{3,}$"},
+    "idea": {"type": "string", "minLength": 1},
+    "mode": {"enum": ["CHANGE", "STAGED", "CRITICAL"]},
+    "target": {"enum": ["CHANGE_COMPLETE", "ARCHITECTURE_BASELINE", "WORKING_MVP", "INTEGRATED_SYSTEM", "RELEASE_CANDIDATE"]},
+    "autonomy": {"const": "HUMAN_ON_BLOCKED"},
+    "requirements_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "authority_envelope": {
+      "type": "object",
+      "required": ["max_task_risk", "allowed_change_classes", "dependency_policy", "public_api_changes", "security_changes", "data_migration", "permission_expansion", "remote_actions", "commit", "push", "publish", "deploy"],
+      "properties": {
+        "max_task_risk": {"enum": ["LOW", "MEDIUM", "HIGH"]},
+        "allowed_change_classes": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "dependency_policy": {"enum": ["existing-only", "allow-new"]},
+        "public_api_changes": {"enum": ["allow", "require-human", "forbidden"]},
+        "security_changes": {"enum": ["allow", "require-human", "forbidden"]},
+        "data_migration": {"enum": ["allow", "require-human", "forbidden"]},
+        "permission_expansion": {"enum": ["allow", "require-human", "forbidden"]},
+        "remote_actions": {"enum": ["require-human", "forbidden"]},
+        "commit": {"const": "forbidden"},
+        "push": {"const": "forbidden"},
+        "publish": {"const": "forbidden"},
+        "deploy": {"const": "forbidden"}
+      },
+      "additionalProperties": false
+    },
+    "phases": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/phase"}},
+    "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "parent_campaign_id": {"type": ["string", "null"], "pattern": "^CAMP-[0-9]{3,}$"},
+    "source_checkpoint": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
+    "proposed_at": {"type": "string", "format": "date-time"},
+    "approved_at": {"type": ["string", "null"], "format": "date-time"}
+  },
+  "additionalProperties": false
+}

@@ -170,7 +170,11 @@ def source_fingerprint(root: Path) -> SourceFingerprint:
         for item in listed.stdout.split(b"\0") if item
     )
     for relative in relative_paths:
-        if relative.parts[0] in {".git", ".autodev"} or relative.parts[0].startswith(".agent.v1-frozen-"):
+        if (
+            relative.parts[0] in {".git", ".autodev"}
+            or relative.parts[0].startswith(".agent.v1-frozen-")
+            or relative.parts[0].startswith(".autodev.v2-frozen-")
+        ):
             continue
         path = root / relative
         try:
@@ -234,7 +238,10 @@ def git_baseline_status(root: Path) -> dict[str, Any]:
     try:
         dirty_paths = [
             path for path in _changed_paths(root)
-            if Path(path).parts and Path(path).parts[0] != ".autodev"
+            if Path(path).parts
+            and Path(path).parts[0] != ".autodev"
+            and not Path(path).parts[0].startswith(".agent.v1-frozen-")
+            and not Path(path).parts[0].startswith(".autodev.v2-frozen-")
         ]
     except (OSError, RuntimeError) as error:
         return {

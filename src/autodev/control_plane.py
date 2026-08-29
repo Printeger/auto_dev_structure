@@ -1,9 +1,10 @@
-"""The sole mutation boundary for AutoDev's canonical V2 state."""
+"""The sole mutation boundary for AutoDev's canonical project and campaign state."""
 
 from __future__ import annotations
 
 import copy
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -32,10 +33,11 @@ _RESULT_EXIT_CODES = {
 }
 
 _PROJECT_TRANSITIONS = {
-    "BOOTSTRAP": frozenset({"ACTIVE", "FAILED"}),
-    "ACTIVE": frozenset({"PAUSED", "BLOCKED", "COMPLETE", "FAILED", "STOPPED"}),
-    "PAUSED": frozenset({"ACTIVE", "BLOCKED", "FAILED", "STOPPED"}),
-    "BLOCKED": frozenset({"ACTIVE", "FAILED", "STOPPED"}),
+    "BOOTSTRAP": frozenset({"IDLE", "ACTIVE", "FAILED"}),
+    "IDLE": frozenset({"ACTIVE", "BLOCKED", "FAILED", "STOPPED"}),
+    "ACTIVE": frozenset({"IDLE", "PAUSED", "BLOCKED", "COMPLETE", "FAILED", "STOPPED"}),
+    "PAUSED": frozenset({"IDLE", "ACTIVE", "BLOCKED", "FAILED", "STOPPED"}),
+    "BLOCKED": frozenset({"IDLE", "ACTIVE", "FAILED", "STOPPED"}),
     "COMPLETE": frozenset(),
     "FAILED": frozenset(),
     "STOPPED": frozenset({"ACTIVE", "FAILED"}),
@@ -56,6 +58,7 @@ _TASK_TRANSITIONS = {
 
 _TASK_ID = re.compile(r"^TASK-[0-9]{3,}$")
 _REQ_ID = re.compile(r"^REQ-[0-9]{3,}$")
+_CAMPAIGN_ID = re.compile(r"^CAMP-[0-9]{3,}$")
 _GLOBAL_WRITE_LOCK = threading.Lock()
 
 
@@ -194,6 +197,20 @@ class ControlPlane:
                 return self._run_finish(command)
             if command.name == "validation.record":
                 return self._record_full_validation(command)
+            if command.name == "campaign.propose":
+                return self._campaign_propose(command)
+            if command.name == "campaign.approve":
+                return self._campaign_approve(command)
+            if command.name == "campaign.transition":
+                return self._campaign_transition(command)
+            if command.name == "campaign.checkpoint":
+                return self._campaign_checkpoint(command)
+            if command.name == "campaign.materialized":
+                return self._campaign_materialized(command)
+            if command.name == "campaign.retarget":
+                return self._campaign_retarget(command)
+            if command.name == "task.admit_batch":
+                return self._task_admit_batch(command)
             raise _CommandFailure("INVALID", f"unknown command: {command.name}")
         except _CommandFailure as error:
             revision = self._best_effort_revision()
@@ -259,10 +276,15 @@ class ControlPlane:
             if not schema_errors:
                 valid_documents.add(basename)
 
+        state_document = documents.get("state.json")
+        state = state_document if isinstance(state_document, dict) else {}
+        is_v3 = "state.json" in valid_documents and "campaigns" in state
         requirements: list[dict[str, str]] = []
-        requirements_valid = False
+        # A V3 Campaign's JSON baseline is the sole requirement source. The
+        # configured Markdown table remains mandatory only for legacy V2 state.
+        requirements_valid = is_v3
         config = documents.get("config.json")
-        if "config.json" in valid_documents and isinstance(config, dict):
+        if not is_v3 and "config.json" in valid_documents and isinstance(config, dict):
             try:
                 requirements_path = self._project_relative(config["requirements_path"])
                 requirements = self._parse_requirements(requirements_path)
@@ -270,16 +292,68 @@ class ControlPlane:
             except (KeyError, OSError, _CommandFailure) as error:
                 errors.append(str(error))
 
-        state_document = documents.get("state.json")
-        state = state_document if isinstance(state_document, dict) else {}
         if "state.json" in valid_documents:
             errors.extend(self._validate_committed_events(state))
+            errors.extend(self._validate_campaigns(state))
+            for campaign_id in state.get("campaigns", {}):
+                try:
+                    campaign_requirements = self._read_json(
+                        self.canonical / "campaigns" / campaign_id / "requirements.json"
+                    )["requirements"]
+                except (OSError, json.JSONDecodeError, KeyError, TypeError):
+                    continue
+                known_ids = {item["id"] for item in requirements}
+                for item in campaign_requirements:
+                    if item.get("id") not in known_ids:
+                        requirements.append({
+                            "id": item["id"], "priority": item["priority"],
+                            "status": "PROPOSED", "acceptance_signal": item["acceptance_signal"],
+                        })
+                        known_ids.add(item["id"])
             policy = documents.get("policy.json")
             if "policy.json" in valid_documents and isinstance(policy, dict):
                 errors.extend(self._validate_tasks(state, policy))
             if requirements_valid:
                 errors.extend(self._state_invariant_errors(state, requirements))
         return state, requirements, errors
+
+    def _validate_campaigns(self, state: Mapping[str, Any]) -> list[str]:
+        errors: list[str] = []
+        campaigns = state.get("campaigns", {})
+        if not isinstance(campaigns, Mapping):
+            return errors
+        for campaign_id, record in campaigns.items():
+            directory = self.canonical / "campaigns" / campaign_id
+            try:
+                contract = self._read_json(directory / "campaign.json")
+                requirements = self._read_json(directory / "requirements.json")
+            except (OSError, json.JSONDecodeError) as error:
+                errors.append(f"{campaign_id}: {error}")
+                continue
+            errors.extend(self._validate_document("campaign", contract, f"{campaign_id}/campaign.json"))
+            errors.extend(self._validate_document("requirements", requirements, f"{campaign_id}/requirements.json"))
+            if not isinstance(contract, dict) or not isinstance(requirements, dict):
+                continue
+            if contract.get("id") != campaign_id or requirements.get("campaign_id") != campaign_id:
+                errors.append(f"{campaign_id}: campaign identity mismatch")
+            if contract.get("requirements_hash") != _canonical_hash(requirements):
+                errors.append(f"{campaign_id}: requirement baseline hash mismatch")
+            requirement_items = requirements.get("requirements", [])
+            if isinstance(requirement_items, list):
+                identifiers = [
+                    item.get("id") for item in requirement_items if isinstance(item, Mapping)
+                ]
+                if len(identifiers) != len(set(identifiers)):
+                    errors.append(f"{campaign_id}: duplicate requirement IDs")
+            for field_name in ("mode", "target", "proposal_hash", "approved_at"):
+                if record.get(field_name) != contract.get(field_name):
+                    errors.append(f"{campaign_id}: state {field_name} does not match frozen contract")
+            if record.get("status") not in {"PROPOSED", "WAITING_FOR_HUMAN"} and not contract.get("approved_at"):
+                errors.append(f"{campaign_id}: active campaign has no approval time")
+        current = state.get("current_campaign_id")
+        if current is not None and current not in campaigns:
+            errors.append("state.json: current_campaign_id is unknown")
+        return errors
 
     def _validate_result(self, *, ready: bool) -> CommandResult:
         state, requirements, errors = self._validated_tree()
@@ -499,6 +573,8 @@ class ControlPlane:
                 errors.extend(self._ready_contract_errors(contract, policy))
             if contract.get("id") != task_id:
                 errors.append(f"{task_id}/contract.json: id does not match Task")
+            if contract.get("campaign_id") is not None:
+                errors.append("contract.json: Campaign Tasks must be admitted atomically by ControlPlane")
             known_requirements = {
                 item["id"]
                 for item in self._parse_requirements(
@@ -733,6 +809,10 @@ class ControlPlane:
         state, requirements, errors = self._validated_tree()
         if errors:
             raise _CommandFailure("INVALID", "cannot complete an invalid project", data={"errors": errors})
+        if "campaigns" in state:
+            raise _CommandFailure(
+                "INVALID", "V3 completion is derived from Campaign target state; COMPLETE is legacy-only",
+            )
         missing: list[str] = []
         if state["project_status"] != "ACTIVE":
             missing.append("project must be ACTIVE")
@@ -767,6 +847,400 @@ class ControlPlane:
             command,
             lambda current: self._set_project_status(current, "COMPLETE"),
         )
+
+    def _campaign_propose(self, command: Command) -> CommandResult:
+        contract = command.arguments.get("contract")
+        requirements = command.arguments.get("requirements")
+        if not isinstance(contract, dict) or not isinstance(requirements, dict):
+            raise _CommandFailure("INVALID", "campaign proposal requires contract and requirements objects")
+        campaign_id = contract.get("id")
+        if not isinstance(campaign_id, str) or not _CAMPAIGN_ID.fullmatch(campaign_id):
+            raise _CommandFailure("INVALID", "Campaign id must match CAMP-NNN")
+        errors = self._validate_document("requirements", requirements, "requirements.json")
+        errors.extend(self._validate_document("campaign", contract, "campaign.json"))
+        if requirements.get("campaign_id") != campaign_id:
+            errors.append("requirements.json: campaign_id mismatch")
+        if contract.get("requirements_hash") != _canonical_hash(requirements):
+            errors.append("campaign.json: requirements_hash mismatch")
+        requirement_items = requirements.get("requirements", [])
+        if isinstance(requirement_items, list):
+            identifiers = [item.get("id") for item in requirement_items if isinstance(item, Mapping)]
+            if len(identifiers) != len(set(identifiers)):
+                errors.append("requirements.json: duplicate requirement IDs")
+        if contract.get("approved_at") is not None:
+            errors.append("campaign.json: proposed Campaign cannot already be approved")
+        if errors:
+            raise _CommandFailure("INVALID", "invalid Campaign proposal", data={"errors": errors})
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            campaigns = state.setdefault("campaigns", {})
+            state.setdefault("current_campaign_id", None)
+            if campaign_id in campaigns:
+                raise _CommandFailure("INVALID", f"Campaign already exists: {campaign_id}")
+            campaigns[campaign_id] = {
+                "status": "PROPOSED",
+                "phase": contract["phases"][0],
+                "mode": contract["mode"],
+                "target": contract["target"],
+                "proposal_hash": contract["proposal_hash"],
+                "checkpoint": contract.get("source_checkpoint"),
+                "last_materialized_checkpoint": contract.get("source_checkpoint"),
+                "approved_at": None,
+            }
+            return state, {"campaign_id": campaign_id, "status": "PROPOSED", "proposal_hash": contract["proposal_hash"]}
+
+        def prepare() -> None:
+            directory = self.canonical / "campaigns" / campaign_id
+            _atomic_replace_json(directory / "requirements.json", requirements)
+            _atomic_replace_json(directory / "campaign.json", contract)
+
+        return self._mutate(command, transform, prepare=prepare)
+
+    def _campaign_approve(self, command: Command) -> CommandResult:
+        campaign_id = command.arguments.get("id")
+        proposal_hash = command.arguments.get("proposal_hash")
+        checkpoint = command.arguments.get("checkpoint")
+        approved_at = command.arguments.get("approved_at") or _utc_now()
+        if not isinstance(campaign_id, str) or not _CAMPAIGN_ID.fullmatch(campaign_id):
+            raise _CommandFailure("INVALID", "campaign approve requires a valid id")
+        if not isinstance(checkpoint, str) or not re.fullmatch(r"[0-9a-f]{40,64}", checkpoint):
+            raise _CommandFailure("INVALID", "campaign approve requires a Git checkpoint")
+        holder: dict[str, Any] = {}
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            record = state.get("campaigns", {}).get(campaign_id)
+            if record is None or record["status"] not in {"PROPOSED", "WAITING_FOR_HUMAN"}:
+                raise _CommandFailure("INVALID", f"Campaign {campaign_id} is not proposed")
+            if proposal_hash != record["proposal_hash"]:
+                raise _CommandFailure("INVALID", "proposal hash mismatch")
+            if state.get("current_campaign_id") not in {None, campaign_id}:
+                current = state["campaigns"].get(state["current_campaign_id"], {})
+                if current.get("status") in {"ACTIVE", "WAITING_FOR_HUMAN"}:
+                    raise _CommandFailure("NOT_READY", "another Campaign is active")
+            contract = self._read_json(self.canonical / "campaigns" / campaign_id / "campaign.json")
+            contract["approved_at"] = approved_at
+            holder["contract"] = contract
+            record.update(status="ACTIVE", checkpoint=checkpoint, last_materialized_checkpoint=checkpoint, approved_at=approved_at)
+            state["current_campaign_id"] = campaign_id
+            state["project_status"] = "ACTIVE"
+            state["blocker"] = None
+            state["next_owner"] = "COMMANDER"
+            state["next_action"] = f"Plan and execute {record['phase']} for {campaign_id}."
+            return state, {"campaign_id": campaign_id, "status": "ACTIVE", "checkpoint": checkpoint}
+
+        def prepare() -> None:
+            _atomic_replace_json(self.canonical / "campaigns" / campaign_id / "campaign.json", holder["contract"])
+
+        return self._mutate(command, transform, prepare=prepare)
+
+    def _campaign_transition(self, command: Command) -> CommandResult:
+        campaign_id = command.arguments.get("id")
+        target_status = command.arguments.get("status")
+        target_phase = command.arguments.get("phase")
+        allowed_status = {
+            "PROPOSED": {"ACTIVE", "WAITING_FOR_HUMAN", "CANCELLED"},
+            "ACTIVE": {"WAITING_FOR_HUMAN", "TARGET_REACHED", "CANCELLED"},
+            "WAITING_FOR_HUMAN": {"ACTIVE", "CANCELLED"},
+            "TARGET_REACHED": {"ACTIVE", "ARCHIVED"},
+            "ARCHIVED": set(), "CANCELLED": set(),
+        }
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            record = state.get("campaigns", {}).get(campaign_id)
+            if record is None:
+                raise _CommandFailure("INVALID", f"unknown Campaign: {campaign_id}")
+            old_status, old_phase = record["status"], record["phase"]
+            if target_status is not None:
+                if target_status not in allowed_status[old_status]:
+                    raise _CommandFailure("INVALID", f"illegal Campaign transition: {old_status} -> {target_status}")
+                record["status"] = target_status
+            if target_phase is not None:
+                contract = self._read_json(self.canonical / "campaigns" / str(campaign_id) / "campaign.json")
+                phases = contract["phases"]
+                if target_phase == "TARGET_REACHED":
+                    if record["status"] != "TARGET_REACHED":
+                        raise _CommandFailure("INVALID", "TARGET_REACHED phase requires target status")
+                elif target_phase not in phases or phases.index(target_phase) != phases.index(old_phase) + 1:
+                    raise _CommandFailure("INVALID", f"illegal Campaign phase transition: {old_phase} -> {target_phase}")
+                record["phase"] = target_phase
+            if record["status"] == "WAITING_FOR_HUMAN":
+                state["project_status"] = "PAUSED"
+                state["next_owner"] = "HUMAN"
+                state["next_action"] = command.arguments.get("next_action") or f"Answer the pending request for {campaign_id}."
+            elif record["status"] == "ACTIVE":
+                state["project_status"] = "ACTIVE"
+                state["next_owner"] = "COMMANDER"
+                state["next_action"] = f"Continue {record['phase']} for {campaign_id}."
+            elif record["status"] == "TARGET_REACHED":
+                record["phase"] = "TARGET_REACHED"
+                state["project_status"] = "IDLE"
+                state["next_owner"] = "HUMAN"
+                state["next_action"] = f"Review, retarget, or archive {campaign_id}."
+            elif record["status"] in {"ARCHIVED", "CANCELLED"}:
+                state["project_status"] = "IDLE"
+                state["current_campaign_id"] = None
+                state["next_owner"] = "COMMANDER"
+                state["next_action"] = "Start or resume a Campaign."
+            return state, {
+                "campaign_id": campaign_id, "from_status": old_status,
+                "to_status": record["status"], "from_phase": old_phase, "to_phase": record["phase"],
+            }
+
+        return self._mutate(command, transform)
+
+    def _campaign_checkpoint(self, command: Command) -> CommandResult:
+        campaign_id = command.arguments.get("id")
+        checkpoint = command.arguments.get("checkpoint")
+        task_id = command.arguments.get("task_id")
+        if not isinstance(checkpoint, str) or not re.fullmatch(r"[0-9a-f]{40,64}", checkpoint):
+            raise _CommandFailure("INVALID", "campaign checkpoint requires a Git commit")
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            record = state.get("campaigns", {}).get(campaign_id)
+            if record is None or record["status"] != "ACTIVE":
+                raise _CommandFailure("NOT_READY", "Campaign is not active")
+            previous = record["checkpoint"]
+            record["checkpoint"] = checkpoint
+            return state, {"campaign_id": campaign_id, "task_id": task_id, "from": previous, "to": checkpoint}
+
+        return self._mutate(command, transform)
+
+    def _campaign_materialized(self, command: Command) -> CommandResult:
+        campaign_id = command.arguments.get("id")
+        checkpoint = command.arguments.get("checkpoint")
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            record = state.get("campaigns", {}).get(campaign_id)
+            if record is None or record["status"] != "TARGET_REACHED":
+                raise _CommandFailure("NOT_READY", "only a reached Campaign can be materialized")
+            if checkpoint != record["checkpoint"]:
+                raise _CommandFailure("INVALID", "materialized checkpoint is not current")
+            record["last_materialized_checkpoint"] = checkpoint
+            state.update(
+                project_status="IDLE", blocker=None, next_owner="HUMAN",
+                next_action=f"Review, retarget, or archive {campaign_id}.",
+            )
+            return state, {"campaign_id": campaign_id, "checkpoint": checkpoint}
+
+        return self._mutate(command, transform)
+
+    def _campaign_retarget(self, command: Command) -> CommandResult:
+        campaign_id = command.arguments.get("id")
+        target = command.arguments.get("target")
+        order = ["ARCHITECTURE_BASELINE", "WORKING_MVP", "INTEGRATED_SYSTEM", "RELEASE_CANDIDATE"]
+        holder: dict[str, Any] = {}
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            record = state.get("campaigns", {}).get(campaign_id)
+            if record is None or record["status"] != "TARGET_REACHED" or record["mode"] == "CHANGE":
+                raise _CommandFailure("NOT_READY", "Campaign cannot be retargeted")
+            if target not in order or order.index(target) <= order.index(record["target"]):
+                raise _CommandFailure("INVALID", "retarget may only increase maturity")
+            old = record["target"]
+            record["target"] = target
+            contract = self._read_json(self.canonical / "campaigns" / str(campaign_id) / "campaign.json")
+            contract["target"] = target
+            holder["contract"] = contract
+            phases = contract["phases"]
+            previous_phase = {
+                "ARCHITECTURE_BASELINE": "SCAFFOLD", "WORKING_MVP": "COMPONENT_VERIFY",
+                "INTEGRATED_SYSTEM": "INTEGRATE", "RELEASE_CANDIDATE": "HARDEN",
+            }[old]
+            index = phases.index(previous_phase)
+            record.update(status="ACTIVE", phase=phases[index + 1])
+            state.update(project_status="ACTIVE", current_campaign_id=campaign_id, next_owner="COMMANDER", blocker=None)
+            state["next_action"] = f"Plan {record['phase']} for retargeted {campaign_id}."
+            return state, {"campaign_id": campaign_id, "from": old, "to": target}
+
+        def prepare() -> None:
+            _atomic_replace_json(self.canonical / "campaigns" / str(campaign_id) / "campaign.json", holder["contract"])
+
+        return self._mutate(command, transform, prepare=prepare)
+
+    def _task_admit_batch(self, command: Command) -> CommandResult:
+        campaign_id = command.arguments.get("campaign_id")
+        contracts = command.arguments.get("contracts")
+        if not isinstance(campaign_id, str) or not isinstance(contracts, list) or not contracts:
+            raise _CommandFailure("INVALID", "task admission requires campaign_id and a non-empty contract batch")
+        if any(not isinstance(item, dict) for item in contracts):
+            raise _CommandFailure("INVALID", "every Task proposal must be an object")
+        approval_request_id = command.arguments.get("human_approval_request_id")
+        human_approved = False
+        if approval_request_id is not None:
+            if not isinstance(approval_request_id, str) or not re.fullmatch(r"HUMAN-[0-9a-f]{12}", approval_request_id):
+                raise _CommandFailure("INVALID", "invalid human approval request id")
+            try:
+                approval = self._read_json(
+                    self.canonical / "campaigns" / str(campaign_id)
+                    / "human-requests" / f"{approval_request_id}.json"
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                raise _CommandFailure("INVALID", f"human approval evidence is unavailable: {error}") from error
+            decision = approval.get("answers", {}).get("decision", [])
+            human_approved = (
+                approval.get("campaign_id") == campaign_id
+                and approval.get("status") == "ANSWERED"
+                and isinstance(decision, list)
+                and bool(decision)
+                and str(decision[0]).lower() == "approve exception"
+            )
+            if not human_approved:
+                raise _CommandFailure("INVALID", "human approval evidence does not approve this exception")
+            try:
+                admission_context = self._read_json(
+                    self.canonical / "campaigns" / str(campaign_id) / "admission-context.json"
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                raise _CommandFailure("INVALID", f"admission context is unavailable: {error}") from error
+            approved_contracts = [
+                dict(item, admission="HUMAN_APPROVED")
+                for item in admission_context.get("contracts", [])
+                if isinstance(item, dict)
+            ]
+            if (
+                admission_context.get("request_id") != approval_request_id
+                or approved_contracts != contracts
+            ):
+                raise _CommandFailure("INVALID", "human approval is not bound to this frozen Task batch")
+        holder: dict[str, Any] = {}
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            campaign = state.get("campaigns", {}).get(campaign_id)
+            if campaign is None or campaign["status"] != "ACTIVE":
+                raise _CommandFailure("NOT_READY", "Campaign is not active")
+            campaign_contract = self._read_json(self.canonical / "campaigns" / campaign_id / "campaign.json")
+            requirement_doc = self._read_json(self.canonical / "campaigns" / campaign_id / "requirements.json")
+            known_requirements = {item["id"] for item in requirement_doc["requirements"]}
+            policy = self._read_json(self.canonical / "policy.json")
+            envelope = campaign_contract["authority_envelope"]
+            errors: list[str] = []
+            authority_errors: list[str] = []
+            ids = [item.get("id") for item in contracts]
+            if len(ids) != len(set(ids)):
+                errors.append("Task batch contains duplicate IDs")
+            available = set(state["tasks"]) | {item for item in ids if isinstance(item, str)}
+            risk_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+            sensitive = {
+                "public-api": "public_api_changes", "public-interface": "public_api_changes",
+                "security": "security_changes", "migration": "data_migration",
+                "permission-expansion": "permission_expansion", "remote-side-effect": "remote_actions",
+            }
+            graph: dict[str, list[str]] = {}
+            for index, contract in enumerate(contracts):
+                label = f"contracts[{index}]"
+                errors.extend(self._validate_document("task-contract", contract, label))
+                task_id = contract.get("id")
+                if task_id in state["tasks"]:
+                    errors.append(f"{label}: Task already exists")
+                if contract.get("campaign_id") != campaign_id:
+                    errors.append(f"{label}: campaign_id mismatch")
+                if contract.get("phase") != campaign["phase"]:
+                    errors.append(f"{label}: phase is not the active Campaign phase")
+                expected_admission = "HUMAN_APPROVED" if human_approved else "AUTO_ADMITTED"
+                if contract.get("admission") != expected_admission:
+                    errors.append(f"{label}: admission does not match recorded authority")
+                unknown = sorted(set(contract.get("requirements", [])) - known_requirements)
+                if unknown:
+                    errors.append(f"{label}: unknown requirements: {', '.join(unknown)}")
+                if risk_order.get(contract.get("risk"), 99) > risk_order[envelope["max_task_risk"]]:
+                    authority_errors.append(f"{label}: risk exceeds Authority Envelope")
+                disallowed = sorted(set(contract.get("change_classes", [])) - set(envelope["allowed_change_classes"]))
+                if disallowed:
+                    authority_errors.append(f"{label}: change classes exceed Authority Envelope: {', '.join(disallowed)}")
+                for change_class, rule in sensitive.items():
+                    if change_class not in contract.get("change_classes", []):
+                        continue
+                    if envelope[rule] == "require-human":
+                        authority_errors.append(f"{label}: {change_class} requires human authority")
+                    elif envelope[rule] == "forbidden":
+                        errors.append(f"{label}: {change_class} is forbidden by the Authority Envelope")
+                for path in contract.get("allowed_paths", []):
+                    if path in {".", "*", "**", "**/*"}:
+                        errors.append(f"{label}: broad root path includes protected state")
+                    if any(
+                        fnmatch.fnmatchcase(path, pattern) or path == pattern.rstrip("/**")
+                        for pattern in policy.get("protected_paths", [])
+                    ):
+                        errors.append(f"{label}: protected path requested: {path}")
+                    if envelope["dependency_policy"] == "existing-only" and PurePosixPath(path).name in {
+                        "pyproject.toml", "requirements.txt", "Pipfile", "poetry.lock",
+                        "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+                    }:
+                        authority_errors.append(f"{label}: dependency manifest change requires human authority")
+                required_prohibitions = {"commit", "push", "publish", "deploy"}
+                actual_prohibitions = {
+                    str(item).strip().lower() for item in contract.get("prohibited_actions", [])
+                }
+                missing_prohibitions = sorted(required_prohibitions - actual_prohibitions)
+                if missing_prohibitions:
+                    errors.append(f"{label}: missing prohibited actions: {', '.join(missing_prohibitions)}")
+                for validation in contract.get("validation_commands", []):
+                    argv = [str(item).lower() for item in validation.get("argv", [])]
+                    if argv and argv[0] == "git" and any(
+                        verb in argv[1:] for verb in ("push", "pull", "fetch", "send-pack")
+                    ):
+                        errors.append(f"{label}: validation command has a remote Git action")
+                errors.extend(self._ready_contract_errors(contract, policy))
+                dependencies = contract.get("dependencies", [])
+                unknown_dependencies = sorted(set(dependencies) - available)
+                if unknown_dependencies:
+                    errors.append(f"{label}: unknown dependencies: {', '.join(unknown_dependencies)}")
+                if isinstance(task_id, str):
+                    graph[task_id] = list(dependencies)
+            visiting: set[str] = set()
+            visited: set[str] = set()
+
+            def visit(task_id: str) -> None:
+                if task_id in visiting:
+                    errors.append("Task dependency graph contains a cycle")
+                    return
+                if task_id in visited:
+                    return
+                visiting.add(task_id)
+                for dependency in graph.get(task_id, []):
+                    if dependency in graph:
+                        visit(dependency)
+                visiting.remove(task_id)
+                visited.add(task_id)
+
+            for task_id in graph:
+                visit(task_id)
+            if not human_approved:
+                errors.extend(authority_errors)
+            if errors:
+                raise _CommandFailure(
+                    "BLOCKED", "Task proposal batch exceeds admission authority",
+                    data={"errors": errors, "human_approvable": not errors or bool(authority_errors)},
+                )
+            now = _utc_now()
+            hashes: dict[str, str] = {}
+            for contract in contracts:
+                task_id = contract["id"]
+                contract_hash = _canonical_hash(contract)
+                hashes[task_id] = contract_hash
+                state["tasks"][task_id] = {
+                    "status": "READY", "generation": 1, "contract_hash": contract_hash,
+                    "claim_id": None, "evidence_ids": [], "blocking": contract["blocking"],
+                    "requirement_ids": list(contract["requirements"]), "created_at": now, "updated_at": now,
+                }
+            holder["hashes"] = hashes
+            return state, {
+                "campaign_id": campaign_id, "task_ids": ids,
+                "admission": "HUMAN_APPROVED" if human_approved else "AUTO_ADMITTED",
+                "human_approval_request_id": approval_request_id,
+            }
+
+        def prepare() -> None:
+            for contract in contracts:
+                task_id = contract["id"]
+                contract_hash = holder["hashes"][task_id]
+                _atomic_replace_json(self.canonical / "tasks" / task_id / "contract.json", contract)
+                _atomic_replace_bytes(
+                    self.canonical / "tasks" / task_id / "contract.md",
+                    self._contract_projection(contract, contract_hash).encode("utf-8"), mode=0o444,
+                )
+
+        return self._mutate(command, transform, prepare=prepare)
 
     def _mutate(
         self,

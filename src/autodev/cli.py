@@ -16,12 +16,21 @@ from autodev import Command, CommandResult, ControlPlane, __version__
 from autodev._project import (
     ProjectOperation,
     apply_migration,
+    apply_v2_migration,
     check_migration,
+    check_v2_migration,
     initialize_project,
     rollback_migration,
+    rollback_v2_migration,
 )
 from autodev._workspace import _write_json_atomic, git_baseline_status, source_fingerprint
 from autodev.engines import CodexExecEngine
+from autodev.engines.app_server import AppServerCodexEngine, CodexExecPlanner, HybridPlanner
+from autodev.campaign import CampaignController, CampaignRequest
+from autodev.human import (
+    AutoResolvingHumanInteraction, PersistentHumanInteraction, TTYHumanInteraction,
+)
+from autodev.reporting import render_report
 from autodev.run_controller import RunController, RunRequest
 
 
@@ -42,16 +51,18 @@ def _parser() -> argparse.ArgumentParser:
     doctor = commands.add_parser("doctor", help="probe project and Codex capabilities")
     doctor.add_argument("--json", action="store_true", dest="as_json")
 
-    init = commands.add_parser("init", help="install V2 project contracts and state")
+    init = commands.add_parser("init", help="install AutoDev project contracts and state")
     init.add_argument("target")
     init.add_argument("--name", required=True)
     init.add_argument("--merge", action="store_true")
 
-    migrate = commands.add_parser("migrate", help="migrate explicit V1 state")
+    migrate = commands.add_parser("migrate", help="migrate explicit V1 or V2 state")
+    migrate.add_argument("migration_version", nargs="?", choices=("v2",))
     migration_mode = migrate.add_mutually_exclusive_group(required=True)
     migration_mode.add_argument("--check", action="store_true")
     migration_mode.add_argument("--apply", action="store_true")
     migration_mode.add_argument("--rollback", metavar="MIGRATION_ID")
+    migrate.add_argument("--adopt-source")
 
     validate = commands.add_parser("validate", help="validate canonical project contracts")
     validate.add_argument("--ready", action="store_true")
@@ -92,9 +103,11 @@ def _parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser("run", help="run one Task or an explicit bounded loop")
     run.add_argument("--task")
-    run.add_argument("--until", choices=("complete-or-blocked",))
+    run.add_argument("--until", choices=("complete-or-blocked", "target-or-blocked"))
     resume = commands.add_parser("resume", help="resume with a fresh attempt")
     resume.add_argument("--recover-stale", action="store_true")
+    resume.add_argument("--campaign")
+    resume.add_argument("--until", choices=("target-or-blocked", "complete-or-blocked"))
     commands.add_parser("stop", help="request process-group cancellation")
 
     checkpoint = commands.add_parser("checkpoint", help="manage source checkpoints")
@@ -105,6 +118,52 @@ def _parser() -> argparse.ArgumentParser:
     logs.add_argument("--run", required=True, dest="run_id")
     evidence = commands.add_parser("evidence", help="show Task evidence")
     evidence.add_argument("task_id")
+
+    start = commands.add_parser("start", help="plan, approve, and run a Campaign")
+    idea = start.add_mutually_exclusive_group(required=True)
+    idea.add_argument("--idea")
+    idea.add_argument("--idea-file")
+    start.add_argument("--mode", default="staged", choices=("change", "staged", "critical"))
+    start.add_argument(
+        "--target", default="working-mvp",
+        choices=("change-complete", "architecture-baseline", "working-mvp", "integrated-system", "release-candidate"),
+    )
+
+    campaign = commands.add_parser("campaign", help="manage V3 Campaigns")
+    campaign_commands = campaign.add_subparsers(dest="campaign_command", required=True)
+    plan = campaign_commands.add_parser("plan")
+    plan_idea = plan.add_mutually_exclusive_group(required=True)
+    plan_idea.add_argument("--idea")
+    plan_idea.add_argument("--idea-file")
+    plan.add_argument("--mode", default="staged", choices=("change", "staged", "critical"))
+    plan.add_argument(
+        "--target", default="working-mvp",
+        choices=("change-complete", "architecture-baseline", "working-mvp", "integrated-system", "release-candidate"),
+    )
+    approve = campaign_commands.add_parser("approve")
+    approve.add_argument("campaign_id")
+    approve.add_argument("--proposal-hash", required=True)
+    campaign_start = campaign_commands.add_parser("start")
+    campaign_start.add_argument("campaign_id")
+    campaign_status = campaign_commands.add_parser("status")
+    campaign_status.add_argument("campaign_id")
+    answer = campaign_commands.add_parser("answer")
+    answer.add_argument("campaign_id")
+    answer.add_argument("--request", required=True, dest="request_id")
+    answer.add_argument("--answer", action="append", required=True, dest="answers")
+    retarget = campaign_commands.add_parser("retarget")
+    retarget.add_argument("campaign_id")
+    retarget.add_argument(
+        "--target", required=True,
+        choices=("architecture-baseline", "working-mvp", "integrated-system", "release-candidate"),
+    )
+    for name in ("materialize", "archive"):
+        subcommand = campaign_commands.add_parser(name)
+        subcommand.add_argument("campaign_id")
+
+    report = commands.add_parser("report", help="derive a Markdown report from canonical evidence")
+    report.add_argument("report_kind", choices=("phase", "requirements", "release"))
+    report.add_argument("--campaign")
     return parser
 
 
@@ -146,6 +205,57 @@ def _render_human(command: Command, result: CommandResult) -> str:
     return result.message + "\n"
 
 
+def _campaign_request(arguments: argparse.Namespace) -> CampaignRequest:
+    if arguments.idea_file:
+        idea = Path(arguments.idea_file).read_text(encoding="utf-8")
+    else:
+        idea = arguments.idea
+    mode = arguments.mode.upper()
+    target = arguments.target.replace("-", "_").upper()
+    if mode == "CHANGE" and arguments.target == "working-mvp":
+        target = "CHANGE_COMPLETE"
+    return CampaignRequest(idea=idea, mode=mode, target=target)
+
+
+def _interaction(root: Path):
+    persistent = PersistentHumanInteraction(root)
+    if sys.stdin.isatty():
+        return AutoResolvingHumanInteraction(TTYHumanInteraction())
+    return AutoResolvingHumanInteraction(persistent)
+
+
+def _planner(root: Path, interaction: object | None = None):
+    interaction = interaction or _interaction(root)
+    return HybridPlanner(
+        AppServerCodexEngine(interaction), CodexExecPlanner(),
+    )
+
+
+def _print_campaign(outcome: object) -> int:
+    print(outcome.message)
+    data = dict(outcome.data)
+    if outcome.campaign_id:
+        data.setdefault("campaign_id", outcome.campaign_id)
+    if data:
+        print(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False))
+    return outcome.exit_code
+
+
+def _confirm_start_approval(outcome: object) -> bool:
+    """Show the one frozen proposal and require an explicit interactive approval."""
+
+    _print_campaign(outcome)
+    if not sys.stdin.isatty():
+        print(
+            "autodev start requires an interactive approval; use campaign plan and "
+            "campaign approve in non-interactive environments",
+            file=sys.stderr,
+        )
+        return False
+    print("Approve this Campaign proposal? [y/N] ", end="", flush=True)
+    return sys.stdin.readline().strip().lower() in {"y", "yes"}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse, execute, and render one AutoDev command."""
 
@@ -154,6 +264,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except _UsageError as error:
         print(f"autodev: {error}", file=sys.stderr)
         return 1
+    requested_until = getattr(arguments, "until", None)
+    if requested_until == "complete-or-blocked" and arguments.command in {"run", "resume"}:
+        print(
+            "warning: complete-or-blocked is deprecated; use target-or-blocked",
+            file=sys.stderr,
+        )
     if arguments.command == "version":
         print(__version__)
         return 0
@@ -210,6 +326,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "message": canonical.message,
             },
         }
+        app_server = AppServerCodexEngine(PersistentHumanInteraction(Path.cwd())).probe()
+        checks["app_server_interaction"] = {
+            "ready": True,
+            "mode": app_server.get("mode", "fallback"),
+            "native": bool(app_server.get("ready")),
+            "request_user_input": bool(app_server.get("request_user_input")),
+            "error": app_server.get("error"),
+        }
         ready = all(item.get("ready", False) for item in checks.values())
         payload = {"ready": ready, "checks": checks}
         if arguments.as_json:
@@ -218,14 +342,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             for name, check in checks.items():
                 print(f"{name}: {'ready' if check.get('ready') else 'not ready'}")
         return 0 if ready else 2
-    if arguments.command in {"run", "resume"} and os.environ.get("AUTODEV_LIVE_CODEX") != "1":
+    campaign_live = arguments.command == "start" or (
+        arguments.command == "campaign" and arguments.campaign_command in {"plan", "start", "answer"}
+    )
+    if (arguments.command in {"run", "resume"} or campaign_live) and os.environ.get("AUTODEV_LIVE_CODEX") != "1":
         print("live Codex requires AUTODEV_LIVE_CODEX=1")
         return 2
     operation: ProjectOperation | None = None
     if arguments.command == "init":
         operation = initialize_project(Path(arguments.target), arguments.name, merge=arguments.merge)
     elif arguments.command == "migrate":
-        if arguments.check:
+        if arguments.migration_version == "v2":
+            if arguments.check:
+                operation = check_v2_migration(Path.cwd())
+            elif arguments.apply:
+                operation = apply_v2_migration(Path.cwd(), adopt_source=arguments.adopt_source)
+            else:
+                operation = rollback_v2_migration(Path.cwd(), arguments.rollback)
+        elif arguments.check:
             operation = check_migration(Path.cwd())
         elif arguments.apply:
             operation = apply_migration(Path.cwd())
@@ -237,7 +371,76 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(operation.data, indent=2, sort_keys=True, ensure_ascii=False))
         return operation.exit_code
 
+    if arguments.command == "report":
+        try:
+            print(render_report(Path.cwd(), arguments.report_kind, campaign_id=arguments.campaign), end="")
+            return 0
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            print(f"cannot render report: {error}", file=sys.stderr)
+            return 1
+
+    if arguments.command in {"start", "campaign"}:
+        interaction = _interaction(Path.cwd()) if (
+            arguments.command == "start"
+            or arguments.campaign_command in {"plan", "start", "answer"}
+        ) else None
+        planner = _planner(Path.cwd(), interaction) if interaction is not None else None
+        controller = CampaignController(Path.cwd(), planner, interaction)
+        if arguments.command == "start":
+            print("AutoDev: starting a fresh read-only Planner...", file=sys.stderr, flush=True)
+            planned = controller.plan(_campaign_request(arguments))
+            if planned.status != "SUCCESS":
+                return _print_campaign(planned)
+            if not _confirm_start_approval(planned):
+                return 2
+            approved = controller.approve(planned.campaign_id or "", planned.data["proposal_hash"])
+            if approved.status != "SUCCESS":
+                return _print_campaign(approved)
+            print("AutoDev: proposal approved; executing the Campaign...", file=sys.stderr, flush=True)
+            outcome = controller.run_until_target_or_blocked(
+                planned.campaign_id or "", CodexExecEngine(), reviewer_engine=CodexExecEngine(),
+            )
+            return _print_campaign(outcome)
+        if arguments.campaign_command == "plan":
+            print("AutoDev: starting a fresh read-only Planner...", file=sys.stderr, flush=True)
+            return _print_campaign(controller.plan(_campaign_request(arguments)))
+        if arguments.campaign_command == "approve":
+            return _print_campaign(controller.approve(arguments.campaign_id, arguments.proposal_hash))
+        if arguments.campaign_command == "status":
+            return _print_campaign(controller.status(arguments.campaign_id))
+        if arguments.campaign_command == "retarget":
+            return _print_campaign(controller.retarget(
+                arguments.campaign_id, arguments.target.replace("-", "_").upper(),
+            ))
+        if arguments.campaign_command == "materialize":
+            return _print_campaign(controller.materialize(arguments.campaign_id))
+        if arguments.campaign_command == "archive":
+            return _print_campaign(controller.archive(arguments.campaign_id))
+        if arguments.campaign_command == "answer":
+            parsed_answers: dict[str, list[str]] = {}
+            for item in arguments.answers:
+                if "=" not in item:
+                    print("--answer must be QUESTION_ID=VALUE", file=sys.stderr)
+                    return 1
+                key, value = item.split("=", 1)
+                parsed_answers.setdefault(key, []).append(value)
+            return _print_campaign(controller.answer(
+                arguments.campaign_id, arguments.request_id, parsed_answers,
+            ))
+        if arguments.campaign_command == "start":
+            return _print_campaign(controller.run_until_target_or_blocked(
+                arguments.campaign_id, CodexExecEngine(), reviewer_engine=CodexExecEngine(),
+            ))
+
     if arguments.command in {"run", "resume"}:
+        if arguments.command == "resume" and arguments.campaign:
+            interaction = _interaction(Path.cwd())
+            controller = CampaignController(
+                Path.cwd(), _planner(Path.cwd(), interaction), interaction,
+            )
+            return _print_campaign(controller.run_until_target_or_blocked(
+                arguments.campaign, CodexExecEngine(), reviewer_engine=CodexExecEngine(),
+            ))
         if arguments.command == "resume":
             stop_file = Path.cwd() / ".autodev/STOP"
             stop_file.unlink(missing_ok=True)
@@ -257,9 +460,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if activated.status != "SUCCESS":
                     print(activated.message)
                     return activated.exit_code
-            request = RunRequest(recover_stale=arguments.recover_stale)
+            legacy_until = "complete-or-blocked" if arguments.until == "target-or-blocked" else arguments.until
+            request = RunRequest(recover_stale=arguments.recover_stale, until=legacy_until)
         else:
-            request = RunRequest(task_id=arguments.task, until=arguments.until)
+            legacy_until = "complete-or-blocked" if arguments.until == "target-or-blocked" else arguments.until
+            request = RunRequest(task_id=arguments.task, until=legacy_until)
         outcome = RunController(Path.cwd(), CodexExecEngine()).run(request)
         print(outcome.message)
         return outcome.exit_code

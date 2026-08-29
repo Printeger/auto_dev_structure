@@ -271,6 +271,28 @@ class RunnerTestCase(unittest.TestCase):
         self.assertEqual(state["project_status"], "BLOCKED")
         self.assertIn("stagnation", state["blocker"].lower())
 
+    def test_repeated_semantic_failure_starts_one_read_only_diagnostic(self) -> None:
+        self.ready_task()
+        first = RunController(
+            self.root, FakeCodexRunner([self.pass_result()], [{"app.txt": "wrong\n"}]),
+        ).run(RunRequest())
+        self.assertEqual(first.status, "NOT_READY", first)
+        diagnostic_result = EngineResult("SUCCESS", {
+            "outcome": "REWORK", "summary": "The implementation violates the assertion.",
+            "blocker": None, "next_action": "Change the emitted value.",
+            "findings": ["app.txt has the wrong value"], "debt_items": [],
+        })
+        diagnostic = FakeCodexRunner([diagnostic_result])
+        second = RunController(
+            self.root, FakeCodexRunner([self.pass_result()], [{"app.txt": "wrong\n"}]),
+            diagnostic_engine=diagnostic,
+        ).run(RunRequest())
+        self.assertEqual(second.status, "NOT_READY", second)
+        self.assertEqual(len(diagnostic.requests), 1)
+        self.assertEqual(diagnostic.requests[0].role, "diagnostic")
+        self.assertEqual(diagnostic.requests[0].permission_profile, ":read-only")
+        self.assertTrue((self.root / f".autodev/runs/{second.run_id}/diagnostic.json").is_file())
+
     def test_pass_with_debt_gate_records_only_permitted_debt(self) -> None:
         self.ready_task()
         debt = {

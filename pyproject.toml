@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "autodev"
 dynamic = ["version"]
-description = "Policy-first autonomous development control plane for Codex"
+description = "Staged autonomous development control plane for Codex"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
 dependencies = ["jsonschema>=4.26,<5"]

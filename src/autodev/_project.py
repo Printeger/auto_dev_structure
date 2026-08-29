@@ -1,4 +1,4 @@
-"""Project installation and explicit V1-to-V2 migration."""
+"""Project installation and explicit V1/V2 migration into V3."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ from typing import Any
 from autodev import __version__
 from autodev._resources import _read_text
 from autodev.control_plane import Command, ControlPlane
+from autodev.campaign import default_authority_envelope
+from autodev.campaign_workspace import CampaignWorkspace
+from autodev._workspace import _write_json_atomic, git_baseline_status, source_fingerprint
+from autodev.quality import QualityRouter
 
 
 def _now() -> str:
@@ -99,8 +104,13 @@ def _bootstrap_documents(name: str, created_at: str | None = None) -> dict[str, 
         ".autodev/.gitignore": (
             ".control-plane.lock\n"
             "STOP\n"
+            "events/*\n"
+            "runs/*\n"
             "locks/*\n"
             "workspaces/*\n"
+            "campaigns/*/checkpoint-journal/*\n"
+            "campaigns/*/phase-summary-*.json\n"
+            "campaigns/*/materialization-journal.json\n"
         ),
         ".codex/agents/autodev-builder.toml": _read_text(
             "templates/.codex/agents/autodev-builder.toml"
@@ -133,7 +143,7 @@ class ProjectOperation:
 
 
 def initialize_project(target: Path, name: str, *, merge: bool = False) -> ProjectOperation:
-    """Install only V2 contracts/state/templates after a full conflict preflight."""
+    """Install contracts, canonical state, and templates after a conflict preflight."""
 
     target = target.resolve()
     if not name.strip() or any(character in name for character in "\r\n"):
@@ -267,6 +277,105 @@ def _migrated_debt(root: Path) -> dict[str, Any]:
     return {"schema_version": 1, "items": items}
 
 
+def _stage_v1_campaign(
+    root: Path, canonical: Path, state: dict[str, Any], contracts: dict[str, str],
+    *, timestamp: str,
+) -> None:
+    """Make the staged V1 import a V3 CHANGE Campaign before it is installed."""
+
+    requirements = _markdown_requirement_baseline(root / "docs/REQUIREMENTS.md", "CAMP-001")
+    router = QualityRouter()
+    for task_id, rendered in list(contracts.items()):
+        contract = json.loads(rendered)
+        contract.update(
+            campaign_id="CAMP-001", phase="IMPLEMENT", admission="HUMAN_APPROVED",
+            review_scope=router.decide(contract).value,
+        )
+        contracts[task_id] = _dump(contract)
+    payload = {
+        "idea": "Continue the migrated V1 project.", "mode": "CHANGE",
+        "target": "CHANGE_COMPLETE", "requirements": requirements,
+        "authority_envelope": default_authority_envelope(), "phases": ["IMPLEMENT"],
+    }
+    campaign = {
+        "$schema": "https://autodev.local/schemas/campaign.schema.json",
+        "schema_version": 1, "id": "CAMP-001", "idea": payload["idea"],
+        "mode": "CHANGE", "target": "CHANGE_COMPLETE", "autonomy": "HUMAN_ON_BLOCKED",
+        "requirements_hash": hashlib.sha256(json.dumps(
+            requirements, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode()).hexdigest(),
+        "authority_envelope": payload["authority_envelope"], "phases": ["IMPLEMENT"],
+        "proposal_hash": hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode()).hexdigest(),
+        "parent_campaign_id": None, "source_checkpoint": None,
+        "proposed_at": timestamp, "approved_at": timestamp,
+    }
+    campaign_dir = canonical / "campaigns" / "CAMP-001"
+    campaign_dir.mkdir(parents=True, exist_ok=True)
+    (campaign_dir / "requirements.json").write_text(_dump(requirements), encoding="utf-8")
+    (campaign_dir / "campaign.json").write_text(_dump(campaign), encoding="utf-8")
+    waiting = state["project_status"] == "BLOCKED"
+    state["framework_version"] = __version__
+    state["current_campaign_id"] = "CAMP-001"
+    state["campaigns"] = {"CAMP-001": {
+        "status": "WAITING_FOR_HUMAN" if waiting else "ACTIVE",
+        "phase": "IMPLEMENT", "mode": "CHANGE", "target": "CHANGE_COMPLETE",
+        "proposal_hash": campaign["proposal_hash"], "checkpoint": None,
+        "last_materialized_checkpoint": None, "approved_at": timestamp,
+    }}
+
+
+def _initialize_v1_campaign_ref(root: Path) -> str | None:
+    """Adopt a Git-backed V1 source snapshot into its new private Campaign ref."""
+
+    baseline = git_baseline_status(root)
+    if not baseline["has_head"]:
+        return None
+    workspace = CampaignWorkspace(root, "CAMP-001")
+    initial = workspace.initialize("HEAD")
+    checkpoint = initial
+    if baseline["dirty_paths"]:
+        worktree = workspace.create_task_workspace("MIGRATE-V1")
+        try:
+            for relative in baseline["dirty_paths"]:
+                source = root / relative
+                destination = worktree / relative
+                if source.is_file() or source.is_symlink():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if source.is_symlink():
+                        destination.unlink(missing_ok=True)
+                        destination.symlink_to(os.readlink(source))
+                    else:
+                        shutil.copy2(source, destination)
+                elif not source.exists() and destination.exists():
+                    if destination.is_dir():
+                        shutil.rmtree(destination)
+                    else:
+                        destination.unlink()
+            adopted = workspace.checkpoint(
+                worktree, task_id="TASK-MIGRATION", run_id="MIGRATE-V1",
+            )
+            checkpoint = adopted.commit
+            workspace.finalize_checkpoint(adopted, canonical_revision=0)
+            baseline_path = root / ".autodev/campaigns/CAMP-001/workspace-baseline.json"
+            baseline_document = json.loads(baseline_path.read_text(encoding="utf-8"))
+            baseline_document["last_materialized_commit"] = checkpoint
+            _write_json_atomic(baseline_path, baseline_document)
+        finally:
+            workspace.remove_task_workspace(worktree)
+    campaign_path = root / ".autodev/campaigns/CAMP-001/campaign.json"
+    campaign = json.loads(campaign_path.read_text(encoding="utf-8"))
+    campaign["source_checkpoint"] = initial
+    _write_json_atomic(campaign_path, campaign)
+    state_path = root / ".autodev/state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["campaigns"]["CAMP-001"]["checkpoint"] = checkpoint
+    state["campaigns"]["CAMP-001"]["last_materialized_checkpoint"] = checkpoint
+    _write_json_atomic(state_path, state)
+    return checkpoint
+
+
 def apply_migration(root: Path) -> ProjectOperation:
     root = root.resolve()
     report = check_migration(root)
@@ -286,6 +395,7 @@ def apply_migration(root: Path) -> ProjectOperation:
         for relative in (item.removeprefix(".autodev/") for item in _CANONICAL_DIRS):
             (temporary / relative).mkdir(parents=True, exist_ok=True)
         state, contracts = _migrated_state(root, name, timestamp)
+        _stage_v1_campaign(root, temporary, state, contracts, timestamp=timestamp)
         debt = _migrated_debt(root)
         state["blocking_debt_ids"] = sorted(
             item["id"] for item in debt["items"]
@@ -338,8 +448,19 @@ def apply_migration(root: Path) -> ProjectOperation:
                 destination = root / ".autodev" / "migrations" / migration_id / "framework-backup" / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(path, destination)
-        return ProjectOperation("SUCCESS", "migration applied", {"migration_id": migration_id})
-    except OSError as error:
+        checkpoint = _initialize_v1_campaign_ref(root)
+        validation = ControlPlane(root).execute(Command("validate"))
+        if validation.status != "SUCCESS":
+            raise RuntimeError("; ".join(validation.data.get("errors", [validation.message])))
+        return ProjectOperation(
+            "SUCCESS", "migration applied",
+            {"migration_id": migration_id, "campaign_id": "CAMP-001", "checkpoint": checkpoint},
+        )
+    except (OSError, RuntimeError, json.JSONDecodeError) as error:
+        subprocess.run(
+            ["git", "update-ref", "-d", "refs/autodev/campaigns/CAMP-001/current"],
+            cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
         return ProjectOperation("INFRA_FAILURE", f"migration failed: {error}", {"migration_id": migration_id})
     finally:
         if temporary.exists():
@@ -373,4 +494,222 @@ def rollback_migration(root: Path, migration_id: str) -> ProjectOperation:
         shutil.rmtree(tombstone)
     except OSError as error:
         return ProjectOperation("INFRA_FAILURE", f"rollback failed: {error}", {})
+    subprocess.run(
+        ["git", "update-ref", "-d", "refs/autodev/campaigns/CAMP-001/current"],
+        cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+    )
     return ProjectOperation("SUCCESS", "migration rolled back", {"migration_id": migration_id})
+
+
+def _markdown_requirement_baseline(path: Path, campaign_id: str) -> dict[str, Any]:
+    requirements: list[dict[str, str]] = []
+    header = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if cells == ["ID", "Priority", "Requirement", "Acceptance signal", "Status"]:
+            header = True
+            continue
+        if not header or len(cells) != 5 or all(set(cell) <= {"-", ":"} for cell in cells):
+            continue
+        requirement_id, priority, statement, acceptance_signal, _status = cells
+        if re.fullmatch(r"REQ-[0-9]{3,}", requirement_id):
+            requirements.append({
+                "id": requirement_id, "priority": priority, "statement": statement,
+                "acceptance_signal": acceptance_signal,
+            })
+    if not requirements:
+        raise ValueError("V2 Markdown contains no importable requirements")
+    return {
+        "$schema": "https://autodev.local/schemas/requirements.schema.json",
+        "schema_version": 1, "campaign_id": campaign_id, "requirements": requirements,
+    }
+
+
+def check_v2_migration(root: Path) -> ProjectOperation:
+    """Inspect an existing V2 canonical tree without writing it."""
+
+    root = root.resolve()
+    canonical = root / ".autodev"
+    try:
+        state = json.loads((canonical / "state.json").read_text(encoding="utf-8"))
+        config = json.loads((canonical / "config.json").read_text(encoding="utf-8"))
+        requirements = _markdown_requirement_baseline(root / config["requirements_path"], "CAMP-001")
+    except (OSError, json.JSONDecodeError, KeyError, ValueError) as error:
+        return ProjectOperation("INVALID", f"cannot inspect V2 project: {error}", {})
+    if state.get("campaigns") is not None:
+        return ProjectOperation("INVALID", "V3 Campaign state already exists", {})
+    baseline = git_baseline_status(root)
+    if not baseline["has_head"]:
+        return ProjectOperation("BLOCKED", baseline["error"] or "Git HEAD is missing", baseline)
+    dirty = not baseline["clean"]
+    fingerprint = source_fingerprint(root).digest if dirty else None
+    return ProjectOperation("SUCCESS", "V2 migration is applicable", {
+        "applicable": True, "v2_status": state.get("project_status"),
+        "requirements": len(requirements["requirements"]),
+        "dirty_paths": baseline["dirty_paths"], "adopt_source_fingerprint": fingerprint,
+    })
+
+
+def apply_v2_migration(root: Path, *, adopt_source: str | None = None) -> ProjectOperation:
+    """Upgrade V2 in place, preserving a recoverable frozen canonical backup."""
+
+    root = root.resolve()
+    report = check_v2_migration(root)
+    if report.status != "SUCCESS":
+        return report
+    required_fingerprint = report.data.get("adopt_source_fingerprint")
+    if required_fingerprint and adopt_source != required_fingerprint:
+        return ProjectOperation("BLOCKED", "dirty V2 source requires exact --adopt-source fingerprint", {
+            "required_fingerprint": required_fingerprint,
+        })
+    migration_id = f"v2-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    canonical = root / ".autodev"
+    backup = root / f".autodev.v2-frozen-{migration_id}"
+    try:
+        shutil.copytree(canonical, backup)
+        state = json.loads((canonical / "state.json").read_text(encoding="utf-8"))
+        config = json.loads((canonical / "config.json").read_text(encoding="utf-8"))
+        requirements = _markdown_requirement_baseline(root / config["requirements_path"], "CAMP-001")
+        workspace = CampaignWorkspace(root, "CAMP-001")
+        initial = workspace.initialize("HEAD")
+        checkpoint = initial
+        if report.data["dirty_paths"]:
+            worktree = workspace.create_task_workspace(f"MIGRATE-{migration_id}")
+            try:
+                for relative in report.data["dirty_paths"]:
+                    source = root / relative
+                    destination = worktree / relative
+                    if source.is_file() or source.is_symlink():
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        if source.is_symlink():
+                            destination.symlink_to(os.readlink(source))
+                        else:
+                            shutil.copy2(source, destination)
+                    elif not source.exists() and destination.exists():
+                        destination.unlink()
+                adopted = workspace.checkpoint(
+                    worktree, task_id="TASK-MIGRATION", run_id=f"MIGRATE-{migration_id}",
+                )
+                checkpoint = adopted.commit
+                workspace.finalize_checkpoint(adopted, canonical_revision=state["revision"])
+                baseline_path = canonical / "campaigns/CAMP-001/workspace-baseline.json"
+                baseline_document = json.loads(baseline_path.read_text(encoding="utf-8"))
+                baseline_document["last_materialized_commit"] = checkpoint
+                _write = json.dumps(baseline_document, indent=2, sort_keys=True) + "\n"
+                baseline_path.write_text(_write, encoding="utf-8")
+            finally:
+                workspace.remove_task_workspace(worktree)
+        target_reached = state.get("project_status") == "COMPLETE"
+        proposed_at = _now()
+        proposal_payload = {
+            "idea": "Continue the migrated V2 project.", "mode": "CHANGE",
+            "target": "CHANGE_COMPLETE", "requirements": requirements,
+            "authority_envelope": default_authority_envelope(), "phases": ["IMPLEMENT"],
+        }
+        campaign = {
+            "$schema": "https://autodev.local/schemas/campaign.schema.json",
+            "schema_version": 1, "id": "CAMP-001", "idea": proposal_payload["idea"],
+            "mode": "CHANGE", "target": "CHANGE_COMPLETE", "autonomy": "HUMAN_ON_BLOCKED",
+            "requirements_hash": hashlib.sha256(json.dumps(
+                requirements, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode()).hexdigest(),
+            "authority_envelope": proposal_payload["authority_envelope"], "phases": ["IMPLEMENT"],
+            "proposal_hash": hashlib.sha256(json.dumps(
+                proposal_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode()).hexdigest(),
+            "parent_campaign_id": None, "source_checkpoint": initial,
+            "proposed_at": proposed_at, "approved_at": proposed_at,
+        }
+        campaign_dir = canonical / "campaigns/CAMP-001"
+        (campaign_dir / "requirements.json").write_text(_dump(requirements), encoding="utf-8")
+        (campaign_dir / "campaign.json").write_text(_dump(campaign), encoding="utf-8")
+        router = QualityRouter()
+        control = ControlPlane(root)
+        for task_id, record in state.get("tasks", {}).items():
+            path = canonical / "tasks" / task_id / "contract.json"
+            contract = json.loads(path.read_text(encoding="utf-8"))
+            contract.update(
+                campaign_id="CAMP-001", phase="IMPLEMENT", admission="HUMAN_APPROVED",
+                review_scope=router.decide(contract).value,
+            )
+            path.write_text(_dump(contract), encoding="utf-8")
+            if record.get("contract_hash") is not None:
+                contract_hash = hashlib.sha256(json.dumps(
+                    contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                ).encode()).hexdigest()
+                record["contract_hash"] = contract_hash
+                projection = canonical / "tasks" / task_id / "contract.md"
+                projection.chmod(0o600) if projection.exists() else None
+                projection.write_text(control._contract_projection(contract, contract_hash), encoding="utf-8")
+                projection.chmod(0o444)
+        state["framework_version"] = __version__
+        state["current_campaign_id"] = None if target_reached else "CAMP-001"
+        state["campaigns"] = {"CAMP-001": {
+            "status": "TARGET_REACHED" if target_reached else "ACTIVE",
+            "phase": "TARGET_REACHED" if target_reached else "IMPLEMENT",
+            "mode": "CHANGE", "target": "CHANGE_COMPLETE", "proposal_hash": campaign["proposal_hash"],
+            "checkpoint": checkpoint, "last_materialized_checkpoint": checkpoint, "approved_at": proposed_at,
+        }}
+        state["project_status"] = "IDLE" if target_reached else "ACTIVE"
+        state["next_owner"] = "HUMAN" if target_reached else "COMMANDER"
+        state["next_action"] = (
+            "Review or archive the migrated Campaign." if target_reached
+            else "Continue the migrated CHANGE Campaign."
+        )
+        (canonical / "state.json").write_text(_dump(state), encoding="utf-8")
+        metadata = {
+            "migration_id": migration_id, "kind": "v2-to-v3", "applied_at": proposed_at,
+            "backup_path": backup.name, "initial_revision": state["revision"],
+            "campaign_id": "CAMP-001", "adopted_source_fingerprint": required_fingerprint,
+        }
+        (canonical / "migrations").mkdir(exist_ok=True)
+        (canonical / "migrations" / f"{migration_id}.json").write_text(_dump(metadata), encoding="utf-8")
+        validation = ControlPlane(root).execute(Command("validate"))
+        if validation.status != "SUCCESS":
+            raise RuntimeError("; ".join(validation.data.get("errors", [validation.message])))
+        return ProjectOperation("SUCCESS", "V2 project migrated to V3", {
+            "migration_id": migration_id, "campaign_id": "CAMP-001", "checkpoint": checkpoint,
+        })
+    except (OSError, RuntimeError, json.JSONDecodeError) as error:
+        subprocess.run(
+            ["git", "update-ref", "-d", "refs/autodev/campaigns/CAMP-001/current"],
+            cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        if backup.exists():
+            failed = root / f".autodev.v3-failed-{uuid.uuid4().hex}"
+            if canonical.exists():
+                os.replace(canonical, failed)
+            shutil.copytree(backup, canonical)
+            shutil.rmtree(failed, ignore_errors=True)
+        return ProjectOperation("INFRA_FAILURE", f"V2 migration failed: {error}", {"migration_id": migration_id})
+
+
+def rollback_v2_migration(root: Path, migration_id: str) -> ProjectOperation:
+    root = root.resolve()
+    canonical = root / ".autodev"
+    try:
+        metadata = json.loads((canonical / "migrations" / f"{migration_id}.json").read_text(encoding="utf-8"))
+        state = json.loads((canonical / "state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return ProjectOperation("INVALID", f"cannot read V2 migration: {error}", {})
+    if metadata.get("kind") != "v2-to-v3":
+        return ProjectOperation("INVALID", "migration is not V2-to-V3", {})
+    if state.get("revision") != metadata.get("initial_revision"):
+        return ProjectOperation("BLOCKED", "rollback refused after first V3 state progress", {})
+    backup = root / metadata["backup_path"]
+    if not backup.is_dir():
+        return ProjectOperation("BLOCKED", "V2 frozen backup is unavailable", {})
+    tombstone = root / f".autodev.v3-rollback-{uuid.uuid4().hex}"
+    try:
+        try:
+            CampaignWorkspace(root, metadata["campaign_id"]).archive(results_materialized=True)
+        except Exception:
+            pass
+        os.replace(canonical, tombstone)
+        os.replace(backup, canonical)
+        shutil.rmtree(tombstone)
+    except OSError as error:
+        return ProjectOperation("INFRA_FAILURE", f"V2 rollback failed: {error}", {})
+    return ProjectOperation("SUCCESS", "V2 migration rolled back", {"migration_id": migration_id})

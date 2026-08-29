@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/human-request.schema.json",
+  "title": "AutoDev persisted human request",
+  "type": "object",
+  "required": ["$schema", "schema_version", "request_id", "campaign_id", "questions", "status", "created_at"],
+  "properties": {
+    "$schema": {"const": "https://autodev.local/schemas/human-request.schema.json"},
+    "schema_version": {"const": 1},
+    "request_id": {"type": "string", "minLength": 1},
+    "campaign_id": {"type": "string", "pattern": "^CAMP-[0-9]{3,}$"},
+    "questions": {"type": "array", "minItems": 1, "maxItems": 3, "items": {"type": "object"}},
+    "status": {"enum": ["PENDING", "ANSWERED", "AUTO_RESOLVED"]},
+    "created_at": {"type": "string", "format": "date-time"},
+    "answers": {"type": "object"},
+    "answered_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

@@ -25,10 +25,12 @@ from autodev._workspace import (
     _write_json_atomic,
     git_baseline_status,
     recover_stale_workspaces,
+    source_fingerprint,
 )
+from autodev.campaign_workspace import CampaignWorkspace, CampaignWorkspaceError, CheckpointConflict
 from autodev.control_plane import Command, ControlPlane
 from autodev.engines import AttemptRequest, EngineResult, ExecutionEngine
-from autodev.quality import requires_independent_review, validate_debt
+from autodev.quality import QualityDecision, QualityRouter, requires_independent_review, validate_debt
 
 
 def _now() -> str:
@@ -86,6 +88,7 @@ class RunController:
         engine: ExecutionEngine,
         *,
         reviewer_engine: ExecutionEngine | None = None,
+        diagnostic_engine: ExecutionEngine | None = None,
         limits: RunLimits | None = None,
     ) -> None:
         self.root = project_root.resolve()
@@ -93,6 +96,8 @@ class RunController:
         self.control = ControlPlane(self.root)
         self.engine = engine
         self.reviewer_engine = reviewer_engine or engine
+        self.diagnostic_engine = diagnostic_engine or self.reviewer_engine
+        self.quality = QualityRouter()
         try:
             policy = json.loads((self.canonical / "policy.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -183,7 +188,14 @@ class RunController:
                 "Review independently from this Task contract, current diff, and validation evidence. "
                 "Inspect the named requirement and interface material in the workspace. Do not use "
                 "Builder reasoning. Order findings by severity and identify every item of missing "
-                "evidence in findings. Return PASS, PASS_WITH_DEBT, REWORK, or BLOCKED."
+                "evidence in findings. Do not report style-only findings. Limit blocking findings "
+                "and debt findings to five each. Return PASS, PASS_WITH_DEBT, REWORK, or BLOCKED."
+            )
+        elif role == "diagnostic":
+            brief = (
+                "Diagnose the repeated semantic failure read-only. Locate the root cause and propose "
+                "a focused repair direction. Do not edit files and do not accept the Task. Return REWORK "
+                "with the diagnosis in summary/findings, or BLOCKED only for a proven external blocker."
             )
         else:
             brief = (
@@ -196,7 +208,7 @@ class RunController:
         return AttemptRequest(
             run_id, task_id, role, workspace, prompt, schema_path, artifact_dir,
             permission_profile=self.runtime[
-                "review_permission_profile" if role == "reviewer" else "build_permission_profile"
+                "review_permission_profile" if role in {"reviewer", "diagnostic"} else "build_permission_profile"
             ],
             runtime_mode=self.runtime["mode"],
             idle_timeout=self.limits.idle_timeout, hard_timeout=self.limits.hard_timeout,
@@ -341,9 +353,16 @@ class RunController:
                 "blocker": "Task attempt or rework budget exhausted.",
                 "next_action": "Increase the Task budget or revise the contract.",
             })
+        campaign_id = contract.get("campaign_id")
+        campaign_workspace = CampaignWorkspace(self.root, campaign_id) if campaign_id else None
         workspace = GitWorkspace(self.root, run_id)
         try:
-            worktree = workspace.create()
+            if campaign_workspace is None:
+                worktree = workspace.create()
+            else:
+                campaign_workspace.recover_checkpoints()
+                worktree = campaign_workspace.create_task_workspace(run_id)
+                workspace.path = worktree
         except (OSError, RuntimeError) as error:
             return self._finish(run_id, "INFRA_FAILURE", proposal={"summary": str(error)})
         self.control.execute(Command("run.phase", {"run_id": run_id, "to": "RUNNING"}))
@@ -411,6 +430,34 @@ class RunController:
             evidence_id, evidence = self._write_evidence(
                 run_dir, task_id, run_id, outcome, contract, proposal, patch, validations, None, None
             )
+            fingerprints = [
+                item.get("stagnation_fingerprint", "") for item in history
+                if item.get("outcome") in {"REWORK", "NO_PROGRESS"}
+            ] + [evidence["stagnation_fingerprint"]]
+            diagnostic_used = any(
+                (self.canonical / "runs" / str(item.get("run_id")) / "diagnostic.json").is_file()
+                for item in history
+            )
+            if self.quality.decide(
+                contract, failure_fingerprints=fingerprints, diagnostic_used=diagnostic_used,
+            ) == QualityDecision.DIAGNOSTIC:
+                diagnostic_context = {
+                    "task": contract,
+                    "failed_validations": [item for item in validations if item["returncode"] != 0],
+                    "failure_fingerprint": evidence["stagnation_fingerprint"],
+                    "prior_evidence": history[-1:] if history else [],
+                }
+                diagnosed = self._execute_with_retry(
+                    self.diagnostic_engine,
+                    self._request(
+                        run_id, task_id, "diagnostic", worktree, diagnostic_context,
+                        run_dir / "diagnostic-01",
+                    ),
+                )
+                diagnostic = diagnosed.proposal if diagnosed.status == "SUCCESS" else {
+                    "outcome": "BLOCKED", "summary": diagnosed.infrastructure_error or diagnosed.status,
+                }
+                _write_json_atomic(run_dir / "diagnostic.json", diagnostic)
             workspace.cleanup()
             if outcome == "NO_PROGRESS":
                 same = 1
@@ -426,7 +473,12 @@ class RunController:
             return self._finish(run_id, outcome, evidence_id=evidence_id, proposal=proposal)
 
         review: dict[str, Any] | None = None
-        if requires_independent_review(contract, rework_count=reworks):
+        quality_decision = self.quality.decide(contract)
+        immediate_review = (
+            quality_decision == QualityDecision.IMMEDIATE
+            if campaign_id else requires_independent_review(contract, rework_count=reworks)
+        )
+        if immediate_review:
             self.control.execute(Command("run.phase", {"run_id": run_id, "to": "REVIEWING"}))
             review_context = {
                 "task": contract, "diff_sha256": _hash(patch),
@@ -457,6 +509,12 @@ class RunController:
                     failure_class="agent_task_failure",
                 )
             review = reviewed.proposal
+            if len(review.get("findings", [])) > 5 or len(review.get("debt_items", [])) > 5:
+                workspace.cleanup()
+                return self._finish(run_id, "BLOCKED", proposal={
+                    "blocker": "Review finding budget exhausted.",
+                    "next_action": "Resolve or consolidate the blocking findings before rereview.",
+                })
             if review["outcome"] in {"REWORK", "BLOCKED"}:
                 if review["outcome"] == "BLOCKED":
                     if not review.get("blocker"):
@@ -477,19 +535,47 @@ class RunController:
             if debt_errors:
                 workspace.cleanup()
                 return self._finish(run_id, "REWORK", proposal={"summary": "; ".join(debt_errors)})
-        checkpoint_path = workspace.checkpoint(patch, changed_paths)
-        checkpoint_id = _hash(checkpoint_path.read_bytes())
+        campaign_checkpoint = None
+        if campaign_workspace is None:
+            checkpoint_path = workspace.checkpoint(patch, changed_paths)
+            checkpoint_id = _hash(checkpoint_path.read_bytes())
+        else:
+            try:
+                campaign_checkpoint = campaign_workspace.checkpoint(
+                    worktree, task_id=task_id, run_id=run_id,
+                )
+            except (CampaignWorkspaceError, CheckpointConflict) as error:
+                workspace.cleanup()
+                return self._finish(
+                    run_id, "INFRA_FAILURE", proposal={"summary": str(error)},
+                    failure_class="checkpoint_conflict",
+                )
+            checkpoint_id = campaign_checkpoint.commit
         evidence_id, _ = self._write_evidence(
             run_dir, task_id, run_id, outcome, contract, proposal, patch, validations, review, checkpoint_id
         )
-        try:
-            workspace.apply(patch)
-        except ConcurrentSourceChange as error:
-            failure_id, _ = self._write_evidence(
-                run_dir, task_id, run_id, "INFRA_FAILURE", contract,
-                {"summary": str(error)}, patch, validations, review, checkpoint_id,
+        if campaign_workspace is None:
+            try:
+                workspace.apply(patch)
+            except ConcurrentSourceChange as error:
+                failure_id, _ = self._write_evidence(
+                    run_dir, task_id, run_id, "INFRA_FAILURE", contract,
+                    {"summary": str(error)}, patch, validations, review, checkpoint_id,
+                )
+                return self._finish(run_id, "INFRA_FAILURE", evidence_id=failure_id, proposal={"summary": str(error)})
+        else:
+            recorded = self.control.execute(Command("campaign.checkpoint", {
+                "id": campaign_id, "checkpoint": checkpoint_id, "task_id": task_id,
+            }))
+            if recorded.status != "SUCCESS":
+                return self._finish(
+                    run_id, "INFRA_FAILURE", evidence_id=evidence_id,
+                    proposal={"summary": recorded.message}, failure_class="checkpoint_journal_pending",
+                )
+            assert campaign_checkpoint is not None
+            campaign_workspace.finalize_checkpoint(
+                campaign_checkpoint, canonical_revision=recorded.revision or 0,
             )
-            return self._finish(run_id, "INFRA_FAILURE", evidence_id=failure_id, proposal={"summary": str(error)})
         workspace.cleanup()
         return self._finish(
             run_id, outcome, evidence_id=evidence_id, checkpoint_id=checkpoint_id, proposal=proposal
@@ -510,7 +596,7 @@ class RunController:
     def run(self, request: RunRequest) -> RunOutcome:
         if request.until not in {None, "complete-or-blocked"}:
             return RunOutcome("INVALID", "--until must be complete-or-blocked")
-        engines = (self.engine, self.reviewer_engine)
+        engines = (self.engine, self.reviewer_engine, self.diagnostic_engine)
         if (
             any(engine.requires_live_authorization for engine in engines)
             and os.environ.get("AUTODEV_LIVE_CODEX") != "1"
@@ -522,14 +608,33 @@ class RunController:
         baseline = git_baseline_status(self.root)
         if not baseline["has_head"]:
             return RunOutcome("NOT_READY", baseline["error"] or "Git HEAD is missing", data=baseline)
-        if not baseline["clean"]:
+        current_campaign_id = self._state().get("current_campaign_id")
+        campaign_source_matches = False
+        if current_campaign_id:
+            try:
+                campaign_baseline = json.loads((
+                    self.canonical / "campaigns" / current_campaign_id / "workspace-baseline.json"
+                ).read_text(encoding="utf-8"))
+                campaign_source_matches = (
+                    source_fingerprint(self.root).digest
+                    == campaign_baseline["source_fingerprint"]["digest"]
+                )
+            except (OSError, json.JSONDecodeError, KeyError, RuntimeError):
+                campaign_source_matches = False
+        if (current_campaign_id and not campaign_source_matches) or (
+            not current_campaign_id and not baseline["clean"]
+        ):
             paths = ", ".join(baseline["dirty_paths"])
             return RunOutcome(
-                "NOT_READY", f"source baseline must be clean outside .autodev: {paths}", data=baseline,
+                "NOT_READY",
+                f"source baseline must match the recorded Campaign source: {paths}"
+                if current_campaign_id else f"source baseline must be clean outside .autodev: {paths}",
+                data=baseline,
             )
         preflight_targets = (
             (self.engine, self.runtime["build_permission_profile"]),
             (self.reviewer_engine, self.runtime["review_permission_profile"]),
+            (self.diagnostic_engine, self.runtime["review_permission_profile"]),
         )
         seen_preflights: set[tuple[int, str, str]] = set()
         for engine, permission_profile in preflight_targets:
@@ -566,6 +671,9 @@ class RunController:
                     return RunOutcome("STOPPED", "STOP requested")
                 task_id = self._select(request.task_id if last.run_id is None else None)
                 if task_id is None:
+                    state = self._state()
+                    if state.get("current_campaign_id"):
+                        return last
                     if not self._project_validation():
                         return last
                     lock.release()

@@ -12,7 +12,7 @@ Reviewing every small BUILD task independently is costly, but Builder self-revie
 
 ## Decision
 
-LOW/MEDIUM BUILD work may pass with Builder self-review, deterministic validation, and the Commander gate. A fresh read-only Reviewer is mandatory for HIGH risk, HARDENING, architecture, public-interface, security, migration, shared schema/data structures, milestone integration, or threshold rework.
+LOW/MEDIUM BUILD work may pass with Builder self-review, deterministic validation, and the Commander gate. A fresh read-only immediate Reviewer is mandatory for HIGH risk, public-interface, security, migration, permission expansion, irreversible data work, and remote side effects. Architecture, internal interfaces, shared internal data, and integration wiring receive one cumulative Phase Review. Two identical semantic failures route to one fresh read-only Diagnostic rather than to a Reviewer.
 
 Reviewer input is limited to the Task contract, relevant requirements/interfaces, diff, and validation evidence. It excludes Builder reasoning history. BUILD blocks only missing required behavior, core test failure, non-negotiable violations, clear regressions, security/correctness defects, and architectural dead ends. Lesser accepted findings become fully recorded debt when eligible.
 
