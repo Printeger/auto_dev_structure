@@ -16,10 +16,10 @@ from jsonschema import Draft202012Validator
 
 from autodev._resources import _read_text
 from autodev._workspace import _write_json_atomic
+from autodev.attempt_lifecycle import AttemptLifecycle
 from autodev.campaign_workspace import CampaignWorkspace, CampaignWorkspaceError
 from autodev.control_plane import Command, ControlPlane
 from autodev.engines import AttemptRequest, ExecutionEngine
-from autodev.quality import QualityRouter
 
 
 TARGET_PHASE = {
@@ -123,7 +123,8 @@ class CampaignController:
         self.control = ControlPlane(self.root)
         self.planner = planner
         self.interaction = interaction
-        self.quality = QualityRouter()
+        self.attempts = AttemptLifecycle(self.root)
+        self.quality = self.attempts.quality
 
     def _state(self) -> dict[str, Any]:
         return json.loads((self.canonical / "state.json").read_text(encoding="utf-8"))
@@ -620,6 +621,17 @@ class CampaignController:
                 "NOT_READY", "Phase gate requires all phase Tasks to be accepted", campaign_id,
                 {"incomplete_tasks": incomplete},
             )
+        summary_path = self.canonical / "campaigns" / campaign_id / f"phase-summary-{phase}.json"
+        if summary_path.is_file():
+            try:
+                accepted_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                accepted_summary = {}
+            if (
+                accepted_summary.get("status") == "PASSED"
+                and accepted_summary.get("checkpoint") == record["checkpoint"]
+            ):
+                return self._advance_phase_gate(campaign_id, record, phase, accepted_summary)
         workspace = CampaignWorkspace(self.root, campaign_id)
         gate_id = f"PHASE-{phase}-{uuid.uuid4().hex[:8]}"
         try:
@@ -737,9 +749,6 @@ class CampaignController:
             if needs_phase_review:
                 if reviewer_engine is None:
                     return CampaignOutcome("NOT_READY", "Phase Review engine is required", campaign_id)
-                summary_path = (
-                    self.canonical / "campaigns" / campaign_id / f"phase-summary-{phase}.json"
-                )
                 review_attempts = 0
                 if summary_path.is_file():
                     try:
@@ -783,10 +792,10 @@ class CampaignController:
                     return CampaignOutcome("INFRA_FAILURE", "Phase Reviewer failed", campaign_id)
                 review = reviewed.proposal
                 blocking = list(review.get("findings", []))
-                debt_findings = list(review.get("debt_items", []))
-                if len(blocking) > 5 or len(debt_findings) > 5:
+                budget_errors = self.attempts.review_budget_errors(review)
+                if budget_errors:
                     return CampaignOutcome(
-                        "BLOCKED", "Phase Review finding budget exhausted", campaign_id,
+                        "BLOCKED", "; ".join(budget_errors), campaign_id,
                     )
                 if review.get("outcome") in {"REWORK", "BLOCKED"}:
                     _write_json_atomic(summary_path, {
@@ -811,6 +820,14 @@ class CampaignController:
             )
         finally:
             workspace.remove_task_workspace(worktree)
+
+        return self._advance_phase_gate(campaign_id, record, phase, summary)
+
+    def _advance_phase_gate(
+        self, campaign_id: str, record: Mapping[str, Any], phase: str,
+        summary: Mapping[str, Any],
+    ) -> CampaignOutcome:
+        """Apply strategy-specific human gates after deterministic Phase acceptance."""
 
         if phase == TARGET_PHASE[record["target"]]:
             if record["mode"] == "CRITICAL":
@@ -920,6 +937,9 @@ class CampaignController:
         })
 
     def archive(self, campaign_id: str) -> CampaignOutcome:
+        reconciled = self._reconcile_terminal(campaign_id, "ASK_HUMAN", "TARGET_REACHED")
+        if reconciled is not None:
+            return reconciled
         state = self._state()
         record = state.get("campaigns", {}).get(campaign_id)
         if record is None:

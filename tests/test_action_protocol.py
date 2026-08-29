@@ -16,6 +16,7 @@ sys.path.insert(0, str(SOURCE_ROOT / "src"))
 from autodev._project import initialize_project
 from autodev.action import ActionController
 from autodev.campaign import CampaignController, CampaignRequest, FakePlanner
+from autodev.campaign_workspace import CampaignWorkspace, CampaignWorkspaceError
 from autodev.control_plane import Command, ControlPlane
 
 
@@ -189,6 +190,44 @@ class ActionProtocolTests(unittest.TestCase):
             recovered.action["id"],
         )
 
+    def test_restart_publishes_immediate_review_after_worker_handoff_fault(self) -> None:
+        campaign_id = self.approve(task(risk="HIGH"))
+        controller = ActionController(self.root)
+        worker = dict(controller.get_next_action(campaign_id).action or {})
+        Path(worker["workspace"]).joinpath("app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        from autodev import control_plane
+
+        original = control_plane._atomic_replace_json
+        failed_once = False
+
+        def fail_reviewer_publication(path: Path, value: object) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once and path.name == "state.json" and isinstance(value, dict)
+                and value.get("current_action_id") is not None
+                and value.get("current_action_id") != worker["id"]
+                and value.get("tasks", {}).get("TASK-001", {}).get("status") == "REVIEWING"
+            ):
+                failed_once = True
+                raise OSError("injected immediate Reviewer publication fault")
+            original(path, value)
+
+        with mock.patch.object(control_plane, "_atomic_replace_json", side_effect=fail_reviewer_publication):
+            interrupted = controller.submit_action_result(worker["id"], self.passing_result(worker))
+
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        state = json.loads((self.root / ".autodev/state.json").read_text())
+        self.assertEqual(state["tasks"]["TASK-001"]["status"], "REVIEWING")
+        self.assertIsNone(state["current_action_id"])
+
+        recovered = ActionController(self.root).get_next_action(campaign_id)
+        repeated = ActionController(self.root).get_next_action(campaign_id)
+
+        self.assertEqual(recovered.status, "SUCCESS", recovered)
+        self.assertEqual(recovered.action["type"], "RUN_IMMEDIATE_REVIEW")
+        self.assertEqual(recovered.action, repeated.action)
+        self.assertEqual(len(list((self.root / ".autodev/actions").glob("*/action.json"))), 2)
+
     def test_retry_reconciles_ref_advanced_before_canonical_checkpoint(self) -> None:
         campaign_id = self.approve()
         controller = ActionController(self.root)
@@ -235,6 +274,75 @@ class ActionProtocolTests(unittest.TestCase):
         journals = list((self.root / ".autodev/campaigns/CAMP-001/checkpoint-journal").glob("*.json"))
         self.assertEqual(len(journals), 1)
         self.assertEqual(json.loads(journals[0].read_text())["phase"], "COMMITTED")
+
+    def test_retry_converges_after_accepted_task_cleanup_fault(self) -> None:
+        campaign_id = self.approve()
+        controller = ActionController(self.root)
+        action = dict(controller.get_next_action(campaign_id).action or {})
+        Path(action["workspace"]).joinpath("app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        result = self.passing_result(action)
+        original_cleanup = CampaignWorkspace.remove_task_workspace
+        failed_once = False
+
+        def fail_accepted_cleanup(owner: CampaignWorkspace, workspace: Path) -> None:
+            nonlocal failed_once
+            state = json.loads((self.root / ".autodev/state.json").read_text())
+            if not failed_once and state["tasks"]["TASK-001"]["status"] == "ACCEPTED":
+                failed_once = True
+                raise CampaignWorkspaceError("injected accepted cleanup fault")
+            original_cleanup(owner, workspace)
+
+        with mock.patch.object(
+            CampaignWorkspace, "remove_task_workspace", autospec=True,
+            side_effect=fail_accepted_cleanup,
+        ):
+            interrupted = controller.submit_action_result(action["id"], result)
+
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        accepted = json.loads((self.root / ".autodev/state.json").read_text())
+        self.assertEqual(accepted["tasks"]["TASK-001"]["status"], "ACCEPTED")
+        self.assertEqual(accepted["current_action_id"], action["id"])
+
+        recovered = ActionController(self.root).submit_action_result(action["id"], result)
+
+        self.assertEqual(recovered.status, "SUCCESS", recovered)
+        self.assertEqual(recovered.action["type"], "TARGET_REACHED")
+        self.assertFalse(Path(action["workspace"]).exists())
+
+    def test_retry_converges_after_accepted_task_action_resolve_fault(self) -> None:
+        campaign_id = self.approve()
+        controller = ActionController(self.root)
+        action = dict(controller.get_next_action(campaign_id).action or {})
+        Path(action["workspace"]).joinpath("app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        result = self.passing_result(action)
+        from autodev import control_plane
+
+        original = control_plane._atomic_replace_json
+        failed_once = False
+
+        def fail_resolve_state(path: Path, value: object) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once and path.name == "state.json" and isinstance(value, dict)
+                and value.get("current_action_id") is None
+                and value.get("tasks", {}).get("TASK-001", {}).get("status") == "ACCEPTED"
+            ):
+                failed_once = True
+                raise OSError("injected accepted Action resolve fault")
+            original(path, value)
+
+        with mock.patch.object(control_plane, "_atomic_replace_json", side_effect=fail_resolve_state):
+            interrupted = controller.submit_action_result(action["id"], result)
+
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        state = json.loads((self.root / ".autodev/state.json").read_text())
+        self.assertEqual(state["tasks"]["TASK-001"]["status"], "ACCEPTED")
+        self.assertEqual(state["current_action_id"], action["id"])
+
+        recovered = ActionController(self.root).submit_action_result(action["id"], result)
+
+        self.assertEqual(recovered.status, "SUCCESS", recovered)
+        self.assertEqual(recovered.action["type"], "TARGET_REACHED")
 
     def test_full_fake_campaign_trace_starts_with_plan_and_reaches_target(self) -> None:
         campaign_id = self.approve_without_phase_tasks()
@@ -401,6 +509,41 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertEqual(reached.status, "SUCCESS", reached)
         self.assertEqual(reached.action["type"], "TARGET_REACHED")
 
+    def test_immediate_review_enforces_shared_finding_and_debt_budgets_without_mutation(self) -> None:
+        campaign_id = self.approve(task(risk="HIGH"))
+        controller = ActionController(self.root)
+        worker = dict(controller.get_next_action(campaign_id).action or {})
+        Path(worker["workspace"]).joinpath("app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        review = dict(
+            controller.submit_action_result(worker["id"], self.passing_result(worker)).action or {}
+        )
+        too_many_findings = self.passing_result(review)
+        too_many_findings["findings"] = [f"blocking-{index}" for index in range(6)]
+        before_findings = self.snapshot()
+
+        rejected_findings = controller.submit_action_result(review["id"], too_many_findings)
+
+        self.assertEqual(rejected_findings.status, "INVALID", rejected_findings)
+        self.assertIn("finding budget", rejected_findings.message)
+        self.assertEqual(self.snapshot(), before_findings)
+        too_many_debt = self.passing_result(review)
+        too_many_debt["outcome"] = "PASS_WITH_DEBT"
+        too_many_debt["data"] = {"debt_items": [
+            {
+                "id": f"DEBT-{index:03d}", "source_task": "TASK-001",
+                "reason": "Deferred cleanup.", "severity": "LOW", "module": "app",
+                "fix_before": "M9", "classification": "maintainability",
+            }
+            for index in range(6)
+        ]}
+        before_debt = self.snapshot()
+
+        rejected_debt = controller.submit_action_result(review["id"], too_many_debt)
+
+        self.assertEqual(rejected_debt.status, "INVALID", rejected_debt)
+        self.assertIn("debt finding budget", rejected_debt.message)
+        self.assertEqual(self.snapshot(), before_debt)
+
     def test_reviewer_pass_with_debt_is_final_and_records_validated_canonical_debt(self) -> None:
         campaign_id = self.approve(task(change_classes=["security"]))
         controller = ActionController(self.root)
@@ -504,6 +647,71 @@ class ActionProtocolTests(unittest.TestCase):
         )
         self.assertEqual(flow["review_attempts"], 2)
 
+    def test_phase_diagnostic_requires_two_durable_identical_validation_failures(self) -> None:
+        first_task = task(change_classes=["architecture"])
+        second_task = task()
+        second_task.update(
+            id="TASK-002", title="Change the value again", objective="Change app.py again.",
+            dependencies=["TASK-001"],
+            validation_commands=[{
+                "argv": ["python3", "-c", "assert open('app.py').read() == 'VALUE = 3\\n'"],
+                "cwd": ".", "timeout": 20,
+            }],
+        )
+        campaign = CampaignController(
+            self.root, FakePlanner([proposal([first_task, second_task])]),
+        )
+        planned = campaign.plan(CampaignRequest(
+            "Exercise repeated Phase failures", target="ARCHITECTURE_BASELINE",
+        ))
+        self.assertEqual(planned.status, "SUCCESS", planned)
+        self.assertEqual(
+            campaign.approve("CAMP-001", planned.data["proposal_hash"]).status, "SUCCESS",
+        )
+        controller = ActionController(self.root)
+        first = dict(controller.get_next_action("CAMP-001").action or {})
+        Path(first["workspace"]).joinpath("app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        second = dict(
+            controller.submit_action_result(first["id"], self.passing_result(first)).action or {}
+        )
+        Path(second["workspace"]).joinpath("app.py").write_text("VALUE = 3\n", encoding="utf-8")
+
+        first_failure = controller.submit_action_result(second["id"], self.passing_result(second))
+
+        self.assertEqual(first_failure.status, "SUCCESS", first_failure)
+        self.assertEqual(first_failure.action["type"], "PLAN_PHASE")
+        self.assertEqual(first_failure.action["context"]["purpose"], "PHASE_REPAIR")
+        flow_path = self.root / ".autodev/campaigns/CAMP-001/phase-flow-SCAFFOLD.json"
+        first_flow = json.loads(flow_path.read_text())
+        self.assertEqual(len(first_flow["failure_fingerprints"]), 1)
+        repair_task = task(change_classes=["architecture"])
+        repair_task.update(
+            id="TASK-003", title="Attempt the Phase repair", objective="Record the focused repair.",
+            dependencies=["TASK-002"], allowed_paths=["repair.txt"],
+            validation_commands=[{
+                "argv": ["python3", "-c", "assert open('repair.txt').read() == 'attempted\\n'"],
+                "cwd": ".", "timeout": 20,
+            }],
+        )
+        plan_result = self.passing_result(dict(first_failure.action))
+        plan_result["data"] = {"phase": "SCAFFOLD", "tasks": [repair_task], "questions": []}
+        repair = controller.submit_action_result(first_failure.action["id"], plan_result)
+        Path(repair.action["workspace"]).joinpath("repair.txt").write_text(
+            "attempted\n", encoding="utf-8",
+        )
+
+        repeated = controller.submit_action_result(
+            repair.action["id"], self.passing_result(dict(repair.action)),
+        )
+
+        self.assertEqual(repeated.status, "SUCCESS", repeated)
+        self.assertEqual(repeated.action["type"], "RUN_DIAGNOSTIC")
+        second_flow = json.loads(flow_path.read_text())
+        self.assertEqual(len(second_flow["failure_fingerprints"]), 2)
+        self.assertEqual(
+            second_flow["failure_fingerprints"][0], second_flow["failure_fingerprints"][1],
+        )
+
     def test_phase_reviewer_pass_with_debt_is_validated_and_canonical(self) -> None:
         campaign_id = self.approve(task(change_classes=["architecture"]))
         controller = ActionController(self.root)
@@ -529,6 +737,35 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertEqual(state["last_outcome"], "PASS_WITH_DEBT")
         canonical = json.loads((self.root / ".autodev/debt.json").read_text())
         self.assertEqual(canonical["items"], [{**debt, "status": "OPEN"}])
+
+    def test_successful_phase_review_obeys_critical_final_writeback_gate(self) -> None:
+        campaign = CampaignController(
+            self.root, FakePlanner([proposal([task(change_classes=["architecture"])])]),
+        )
+        planned = campaign.plan(CampaignRequest(
+            "Critical change", mode="CRITICAL", target="ARCHITECTURE_BASELINE",
+        ))
+        self.assertEqual(planned.status, "SUCCESS", planned)
+        self.assertEqual(
+            campaign.approve("CAMP-001", planned.data["proposal_hash"]).status, "SUCCESS",
+        )
+        controller = ActionController(self.root)
+        worker = dict(controller.get_next_action("CAMP-001").action or {})
+        Path(worker["workspace"]).joinpath("app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        review = dict(
+            controller.submit_action_result(worker["id"], self.passing_result(worker)).action or {}
+        )
+
+        gated = controller.submit_action_result(review["id"], self.passing_result(review))
+
+        self.assertEqual(gated.status, "SUCCESS", gated)
+        self.assertEqual(gated.action["type"], "ASK_HUMAN")
+        state = json.loads((self.root / ".autodev/state.json").read_text())
+        self.assertEqual(state["campaigns"]["CAMP-001"]["status"], "WAITING_FOR_HUMAN")
+        gate = json.loads(
+            (self.root / ".autodev/campaigns/CAMP-001/gate-context.json").read_text()
+        )
+        self.assertEqual(gate["kind"], "final-writeback")
 
     def test_pause_finishes_current_action_and_restart_continues_without_duplicate_checkpoint(self) -> None:
         campaign_id = self.approve()
@@ -580,6 +817,24 @@ class ActionProtocolTests(unittest.TestCase):
         planning = ActionController(self.root).get_next_action(campaign_id)
         self.assertEqual(planning.status, "SUCCESS", planning)
         self.assertEqual(planning.action["type"], "PLAN_PHASE")
+
+    def test_archive_reconciles_terminal_target_action_and_future_reads_are_not_stale(self) -> None:
+        campaign_id = self.approve()
+        controller = ActionController(self.root)
+        worker = dict(controller.get_next_action(campaign_id).action or {})
+        Path(worker["workspace"]).joinpath("app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        target = controller.submit_action_result(worker["id"], self.passing_result(worker))
+        self.assertEqual(target.action["type"], "TARGET_REACHED")
+
+        archived = CampaignController(self.root).archive(campaign_id)
+        after_archive = ActionController(self.root).get_next_action(campaign_id)
+
+        self.assertEqual(archived.status, "SUCCESS", archived)
+        self.assertEqual(after_archive.status, "NOT_READY", after_archive)
+        self.assertIsNone(after_archive.action)
+        state = json.loads((self.root / ".autodev/state.json").read_text())
+        self.assertEqual(state["campaigns"][campaign_id]["status"], "ARCHIVED")
+        self.assertIsNone(state["current_action_id"])
 
     def test_terminal_ask_human_action_is_reconciled_before_answer(self) -> None:
         initial = proposal([])

@@ -93,6 +93,21 @@ class AttemptLifecycle:
             return validate_debt(contract, debt_items)
         return ["debt_items require PASS_WITH_DEBT"] if debt_items else []
 
+    def review_budget_errors(self, result: Mapping[str, Any]) -> list[str]:
+        """Apply the same bounded Reviewer output contract on every transport."""
+
+        findings = result.get("findings", [])
+        data = result.get("data", {})
+        debt_items = data.get("debt_items", []) if isinstance(data, Mapping) else []
+        if not debt_items:
+            debt_items = result.get("debt_items", [])
+        errors: list[str] = []
+        if len(findings) > self.budget.max_blocking_findings:
+            errors.append("Review exceeded the blocking finding budget")
+        if len(debt_items) > self.budget.max_debt_findings:
+            errors.append("Review exceeded the debt finding budget")
+        return errors
+
     def recover_or_checkpoint(
         self, *, campaign_id: str, workspace: Path, task_id: str, run_id: str,
     ) -> CheckpointResult:

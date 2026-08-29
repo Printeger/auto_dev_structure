@@ -25,7 +25,7 @@ from autodev._workspace import (
     GitWorkspace, PatchPolicyViolation, _write_json_atomic, source_fingerprint,
 )
 from autodev.attempt_lifecycle import AttemptLifecycle
-from autodev.campaign import CampaignController, TARGET_PHASE
+from autodev.campaign import CampaignController
 from autodev.campaign_workspace import CampaignWorkspace, CampaignWorkspaceError
 from autodev.control_plane import Command, ControlPlane
 from autodev.quality import QualityDecision
@@ -202,6 +202,9 @@ class ActionController:
         ):
             return ActionOutcome("INVALID", "stale Action revision")
         if action["type"] == "EXECUTE_TASK":
+            task = state.get("tasks", {}).get(action.get("task_id"), {})
+            if task.get("status") == "ACCEPTED":
+                return self._recover_accepted_worker(action, dict(result))
             return self._submit_worker(action, dict(result))
         if action["type"] == "PLAN_PHASE":
             return self._submit_plan(action, dict(result))
@@ -282,6 +285,22 @@ class ActionController:
             )
         if context.get("campaign_id") != campaign_id or context.get("task_id") != task_id:
             return ActionOutcome("INFRA_FAILURE", "claimed run publication context is inconsistent")
+        task_status = state.get("tasks", {}).get(task_id, {}).get("status")
+        if task_status == "REVIEWING":
+            try:
+                attempt = json.loads(
+                    (self._canonical / "runs" / run_id / "action-attempt.json").read_text(encoding="utf-8")
+                )
+                worker = json.loads(
+                    (self._canonical / "actions" / str(attempt["worker_action_id"]) / "action.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            except (OSError, KeyError, json.JSONDecodeError) as error:
+                return ActionOutcome(
+                    "INFRA_FAILURE", f"Reviewer handoff cannot be recovered: {error}",
+                )
+            return self._create_immediate_review(worker, Path(context["workspace"]), attempt)
         action_id = str(context.get("action_id", ""))
         action_path = self._canonical / "actions" / action_id / "action.json"
         if action_path.is_file():
@@ -424,24 +443,33 @@ class ActionController:
                     seen.add(key)
         flow = self._read_phase_flow(campaign_id, phase)
         budget = self._attempts.budget
+        phase_context_ref = f"runs/{run_id}/phase-context.json"
+        _write_json_atomic(self._canonical / phase_context_ref, {
+            "phase_task_ids": [item[0] for item in phase_tasks],
+            "validations": validations,
+        })
         if any(item["returncode"] != 0 for item in validations):
             fingerprint = _hash([
                 {"argv": item["argv"], "returncode": item["returncode"], "timed_out": item["timed_out"]}
                 for item in validations if item["returncode"] != 0
             ])
+            failure_fingerprints = list(flow.get("failure_fingerprints", []))
+            failure_fingerprints.append(fingerprint)
+            flow["failure_fingerprints"] = failure_fingerprints[-8:]
+            flow["last_failure_ref"] = phase_context_ref
             route = self._attempts.quality.decide(
                 self._task_contract(phase_tasks[0][0]),
-                failure_fingerprints=[fingerprint, fingerprint],
+                failure_fingerprints=flow["failure_fingerprints"],
                 diagnostic_used=int(flow.get("diagnostic_attempts", 0)) > 0,
             )
-            if (
-                route != QualityDecision.DIAGNOSTIC
-                or int(flow.get("diagnostic_attempts", 0)) >= budget.diagnostics_per_task
-            ):
+            if route != QualityDecision.DIAGNOSTIC:
                 owner.remove_task_workspace(workspace)
-                return self._block_phase_budget(
-                    campaign_id, phase, "Phase diagnostic budget exhausted",
-                )
+                flow["status"] = "REPAIR_PLAN"
+                self._write_phase_flow(campaign_id, phase, flow)
+                return self._create_plan(campaign_id, phase, repair=True)
+            if int(flow.get("diagnostic_attempts", 0)) >= budget.diagnostics_per_task:
+                owner.remove_task_workspace(workspace)
+                return self._block_phase_budget(campaign_id, phase, "Phase diagnostic budget exhausted")
             action_type, role, route_value = "RUN_DIAGNOSTIC", "diagnostic", "DIAGNOSTIC"
             flow["diagnostic_attempts"] = int(flow.get("diagnostic_attempts", 0)) + 1
             flow["last_failure_fingerprint"] = fingerprint
@@ -454,11 +482,6 @@ class ActionController:
             action_type, role, route_value = "RUN_PHASE_REVIEW", "reviewer", "PHASE"
             flow["review_attempts"] = int(flow.get("review_attempts", 0)) + 1
             flow["status"] = "REVIEW_PENDING"
-        phase_context_ref = f"runs/{run_id}/phase-context.json"
-        _write_json_atomic(self._canonical / phase_context_ref, {
-            "phase_task_ids": [item[0] for item in phase_tasks],
-            "validations": validations,
-        })
         self._write_phase_flow(campaign_id, phase, flow)
         action = self._action_record(
             action_id=f"ACTION-{uuid.uuid4().hex}", action_type=action_type,
@@ -566,6 +589,7 @@ class ActionController:
                 return ActionOutcome(reviewing.status, reviewing.message, data=reviewing.data)
             attempt = {
                 "worker_action_id": action["id"], "worker_result": result,
+                "review_action_id": f"ACTION-{uuid.uuid4().hex}",
                 "patch_hash": _hash(patch), "changed_paths": changed_paths,
                 "validations": validations,
             }
@@ -696,21 +720,32 @@ class ActionController:
     def _create_immediate_review(
         self, worker: Mapping[str, Any], workspace: Path, attempt: Mapping[str, Any],
     ) -> ActionOutcome:
-        action = self._action_record(
-            action_id=f"ACTION-{uuid.uuid4().hex}", action_type="RUN_IMMEDIATE_REVIEW",
-            campaign_id=str(worker["campaign_id"]), phase=worker["phase"],
-            task_id=str(worker["task_id"]), role="reviewer", quality_route="IMMEDIATE",
-            workspace=workspace,
-            context={
-                "run_id": worker["context"]["run_id"],
-                "contract_ref": worker["context"]["contract_ref"],
-                "contract_hash": worker["context"]["contract_hash"],
-                "source_fingerprint": worker["context"]["source_fingerprint"],
-                "worker_action_id": worker["id"],
-                "patch_hash": attempt["patch_hash"],
-                "attempt_ref": f"runs/{worker['context']['run_id']}/action-attempt.json",
-            },
-        )
+        action_id = str(attempt.get("review_action_id", ""))
+        action_path = self._canonical / "actions" / action_id / "action.json"
+        if action_path.is_file():
+            try:
+                action = json.loads(action_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as error:
+                return ActionOutcome("INFRA_FAILURE", f"orphan Reviewer Action is invalid: {error}")
+        else:
+            action = self._action_record(
+                action_id=action_id, action_type="RUN_IMMEDIATE_REVIEW",
+                campaign_id=str(worker["campaign_id"]), phase=worker["phase"],
+                task_id=str(worker["task_id"]), role="reviewer", quality_route="IMMEDIATE",
+                workspace=workspace,
+                context={
+                    "run_id": worker["context"]["run_id"],
+                    "contract_ref": worker["context"]["contract_ref"],
+                    "contract_hash": worker["context"]["contract_hash"],
+                    "source_fingerprint": worker["context"]["source_fingerprint"],
+                    "worker_action_id": worker["id"],
+                    "patch_hash": attempt["patch_hash"],
+                    "attempt_ref": f"runs/{worker['context']['run_id']}/action-attempt.json",
+                },
+            )
+        state = self._read_state()
+        if action.get("canonical_revision") != state.get("revision", -1) + 1:
+            return ActionOutcome("INFRA_FAILURE", "orphan Reviewer Action revision cannot be reconciled")
         return self._persist_action(action)
 
     def _submit_review(self, action: dict[str, Any], result: dict[str, Any]) -> ActionOutcome:
@@ -719,6 +754,9 @@ class ActionController:
             return ActionOutcome("INVALID", "read-only Reviewer modified its workspace")
         if source_fingerprint(self._root).digest != action["context"]["source_fingerprint"]:
             return ActionOutcome("INVALID", "source changed concurrently during Review")
+        budget_errors = self._attempts.review_budget_errors(result)
+        if budget_errors:
+            return ActionOutcome("INVALID", budget_errors[0], data={"errors": budget_errors})
         if result["outcome"] not in {"PASS", "PASS_WITH_DEBT"}:
             return self._finish_nonpassing(action, result)
         run_id = str(action["context"]["run_id"])
@@ -765,10 +803,9 @@ class ActionController:
             return ActionOutcome("INVALID", "source changed concurrently during Phase Review")
         budget = self._attempts.budget
         debt_items = result["data"].get("debt_items", [])
-        if len(result["findings"]) > budget.max_blocking_findings:
-            return ActionOutcome("INVALID", "Phase Review exceeded the blocking finding budget")
-        if len(debt_items) > budget.max_debt_findings:
-            return ActionOutcome("INVALID", "Phase Review exceeded the debt finding budget")
+        budget_errors = self._attempts.review_budget_errors(result)
+        if budget_errors:
+            return ActionOutcome("INVALID", budget_errors[0], data={"errors": budget_errors})
         campaign_id = str(action["campaign_id"])
         phase = str(action["phase"])
         flow = self._read_phase_flow(campaign_id, phase)
@@ -836,30 +873,10 @@ class ActionController:
         )
         if resolved.status != "SUCCESS":
             return resolved
-        campaign = self._read_state()["campaigns"][campaign_id]
-        if phase == TARGET_PHASE[campaign["target"]]:
-            reached = self._control.execute(Command("campaign.transition", {
-                "id": campaign_id, "status": "TARGET_REACHED", "phase": "TARGET_REACHED",
-            }))
-            if reached.status != "SUCCESS":
-                return ActionOutcome(reached.status, reached.message, data=reached.data)
-            materialized = CampaignController(self._root).materialize(campaign_id)
-            if materialized.status != "SUCCESS":
-                final = self.get_next_action(campaign_id)
-            else:
-                final = self.get_next_action(campaign_id)
-        else:
-            contract = json.loads(
-                (self._canonical / "campaigns" / campaign_id / "campaign.json").read_text(encoding="utf-8")
-            )
-            phases = contract["phases"]
-            next_phase = phases[phases.index(phase) + 1]
-            advanced = self._control.execute(Command(
-                "campaign.transition", {"id": campaign_id, "phase": next_phase},
-            ))
-            if advanced.status != "SUCCESS":
-                return ActionOutcome(advanced.status, advanced.message, data=advanced.data)
-            final = self.get_next_action(campaign_id)
+        gated = CampaignController(self._root).phase_gate(campaign_id)
+        if gated.status not in {"SUCCESS", "NOT_READY"}:
+            return ActionOutcome(gated.status, gated.message, data=gated.data)
+        final = self.get_next_action(campaign_id)
         _write_json_atomic(
             self._canonical / "actions" / action["id"] / "outcome.json",
             self._outcome_dict(final),
@@ -901,7 +918,9 @@ class ActionController:
         }))
         if finished.status != "SUCCESS":
             return ActionOutcome(finished.status, finished.message, data=finished.data)
-        CampaignWorkspace(self._root, campaign_id).remove_task_workspace(workspace)
+        cleanup = self._safe_cleanup(campaign_id, workspace)
+        if cleanup is not None:
+            return cleanup
         provisional = ActionOutcome("SUCCESS", f"Action {action['id']} accepted")
         resolved = self._resolve(action, submitted_result or result, provisional)
         if resolved.status != "SUCCESS":
@@ -919,6 +938,53 @@ class ActionController:
             self._outcome_dict(final),
         )
         return final
+
+    def _recover_accepted_worker(
+        self, action: dict[str, Any], result: dict[str, Any],
+    ) -> ActionOutcome:
+        """Finish publication after acceptance crossed the durable run boundary."""
+
+        run_id = str(action["context"]["run_id"])
+        try:
+            evidence = json.loads(
+                (self._canonical / "runs" / run_id / "evidence.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            return ActionOutcome("INFRA_FAILURE", f"accepted Action evidence cannot be recovered: {error}")
+        state = self._read_state()
+        task = state.get("tasks", {}).get(action.get("task_id"), {})
+        if (
+            evidence.get("action_id") != action["id"]
+            or evidence.get("result_hash") != _hash(result)
+            or evidence.get("evidence_id") not in task.get("evidence_ids", [])
+        ):
+            return ActionOutcome("INFRA_FAILURE", "accepted Action evidence is inconsistent")
+        cleanup = self._safe_cleanup(str(action["campaign_id"]), Path(action["workspace"]))
+        if cleanup is not None:
+            return cleanup
+        resolved = self._resolve(
+            action, result, ActionOutcome("SUCCESS", f"Action {action['id']} recovered"),
+        )
+        if resolved.status != "SUCCESS":
+            return resolved
+        campaign_id = str(action["campaign_id"])
+        progressed = CampaignController(self._root).phase_gate(campaign_id)
+        if progressed.status not in {"SUCCESS", "NOT_READY"}:
+            final = ActionOutcome(progressed.status, progressed.message, data=progressed.data)
+        else:
+            final = self.get_next_action(campaign_id)
+        _write_json_atomic(
+            self._canonical / "actions" / action["id"] / "outcome.json",
+            self._outcome_dict(final),
+        )
+        return final
+
+    def _safe_cleanup(self, campaign_id: str, workspace: Path) -> ActionOutcome | None:
+        try:
+            CampaignWorkspace(self._root, campaign_id).remove_task_workspace(workspace)
+        except CampaignWorkspaceError as error:
+            return ActionOutcome("INFRA_FAILURE", f"workspace cleanup must be retried: {error}")
+        return None
 
     def _finish_nonpassing(
         self, action: dict[str, Any], result: dict[str, Any],

@@ -486,13 +486,11 @@ class RunController:
                     failure_class="agent_task_failure",
                 )
             review = reviewed.proposal
-            if (
-                len(review.get("findings", [])) > self.attempts.budget.max_blocking_findings
-                or len(review.get("debt_items", [])) > self.attempts.budget.max_debt_findings
-            ):
+            budget_errors = self.attempts.review_budget_errors(review)
+            if budget_errors:
                 workspace.cleanup()
                 return self._finish(run_id, "BLOCKED", proposal={
-                    "blocker": "Review finding budget exhausted.",
+                    "blocker": "; ".join(budget_errors),
                     "next_action": "Resolve or consolidate the blocking findings before rereview.",
                 })
             if review["outcome"] in {"REWORK", "BLOCKED"}:
