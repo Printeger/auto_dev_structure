@@ -296,8 +296,8 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
             "answer_blocker": (False, True, True, False),
             "retarget_campaign": (False, True, True, False),
             "materialize_campaign": (False, True, False, False),
-            "get_next_action": (False, False, True, False),
-            "submit_action_result": (False, False, True, False),
+            "get_next_action": (False, True, True, False),
+            "submit_action_result": (False, True, True, False),
         }
         for name, expected in expected_annotations.items():
             annotation = tools[name].annotations
@@ -487,6 +487,80 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
                 "request_id": request_id, "answers": {"decision": ["Approve exception"]},
             })
             self.assertFalse(answered.is_error, answered)
+            self.assertFalse(self.codex_sentinel.exists())
+
+    async def test_generic_blocker_cancel_is_a_schema_valid_success(self) -> None:
+        async with self.session() as session:
+            await session.call_tool("initialize_project", {
+                "project_root": str(self.root), "name": "cancel-flow", "merge": False,
+            })
+            (self.root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            git(self.root, "add", ".")
+            git(self.root, "commit", "-qm", "base")
+            proposed = await session.call_tool("propose_campaign", {
+                "project_root": str(self.root), "idea": "Cancelable change",
+                "development_strategy": "CHANGE", "target": "CHANGE_COMPLETE",
+                "autonomy": "HUMAN_ON_BLOCKED", "proposal": proposal(),
+            })
+            campaign_id = proposed.structured_content["campaign_id"]
+            approved = await session.call_tool("approve_campaign", {
+                "project_root": str(self.root), "campaign_id": campaign_id,
+                "proposal_hash": proposed.structured_content["data"]["proposal_hash"],
+                "proposal_and_authority_confirmed": True,
+            })
+            self.assertFalse(approved.is_error, approved)
+            blocked = ControlPlane(self.root).execute(Command("project.transition", {
+                "to": "BLOCKED", "blocker": "External prerequisite failed.",
+                "next_action": "Cancel this Campaign.",
+            }))
+            self.assertEqual(blocked.status, "SUCCESS", blocked)
+            waiting = await session.call_tool("get_next_action", {
+                "project_root": str(self.root), "campaign_id": campaign_id,
+            })
+            self.assertEqual(waiting.structured_content["action"]["type"], "ASK_HUMAN")
+            request_id = waiting.structured_content["action"]["context"]["request_id"]
+            retried = await session.call_tool("answer_blocker", {
+                "project_root": str(self.root), "campaign_id": campaign_id,
+                "request_id": request_id,
+                "answers": {"resolution": ["Retry Campaign"]},
+            })
+            self.assertFalse(retried.is_error, retried)
+            self.assertEqual(retried.structured_content["status"], "SUCCESS")
+            blocked_again = ControlPlane(self.root).execute(Command("project.transition", {
+                "to": "BLOCKED", "blocker": "External prerequisite failed again.",
+                "next_action": "Cancel this Campaign.",
+            }))
+            self.assertEqual(blocked_again.status, "SUCCESS", blocked_again)
+            waiting_again = await session.call_tool("get_next_action", {
+                "project_root": str(self.root), "campaign_id": campaign_id,
+            })
+            self.assertEqual(
+                waiting_again.structured_content["action"]["type"], "ASK_HUMAN",
+            )
+            request_id = waiting_again.structured_content["action"]["context"]["request_id"]
+            cancelled = await session.call_tool("answer_blocker", {
+                "project_root": str(self.root), "campaign_id": campaign_id,
+                "request_id": request_id,
+                "answers": {"resolution": ["Cancel Campaign"]},
+            })
+            self.assertFalse(cancelled.is_error, cancelled)
+            self.assertEqual(cancelled.structured_content["status"], "SUCCESS")
+            self.assertNotEqual(
+                cancelled.structured_content["data"].get("error_code"), "OUTPUT_CONTRACT",
+            )
+            listed = await session.list_tools()
+            schema = next(
+                tool.output_schema for tool in listed.tools if tool.name == "answer_blocker"
+            )
+            self.assertFalse(list(
+                Draft202012Validator(schema).iter_errors(retried.structured_content)
+            ))
+            self.assertFalse(list(
+                Draft202012Validator(schema).iter_errors(cancelled.structured_content)
+            ))
+            state = json.loads((self.root / ".autodev/state.json").read_text())
+            self.assertEqual(state["campaigns"][campaign_id]["status"], "CANCELLED")
+            self.assertIsNone(state["current_action_id"])
             self.assertFalse(self.codex_sentinel.exists())
 
 

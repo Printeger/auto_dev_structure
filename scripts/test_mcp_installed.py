@@ -21,6 +21,20 @@ TOOL_NAMES = {
     "campaign_status", "campaign_continue", "pause_campaign", "answer_blocker",
     "retarget_campaign", "materialize_campaign", "get_next_action", "submit_action_result",
 }
+TOOL_ANNOTATIONS = {
+    "inspect_project": (True, False, True, False),
+    "initialize_project": (False, False, True, False),
+    "propose_campaign": (False, False, False, False),
+    "approve_campaign": (False, False, False, False),
+    "campaign_status": (True, False, True, False),
+    "campaign_continue": (False, False, False, False),
+    "pause_campaign": (False, False, False, False),
+    "answer_blocker": (False, True, True, False),
+    "retarget_campaign": (False, True, True, False),
+    "materialize_campaign": (False, True, False, False),
+    "get_next_action": (False, True, True, False),
+    "submit_action_result": (False, True, True, False),
+}
 
 
 def installed_layout_smoke(repository: Path) -> dict[str, object]:
@@ -68,6 +82,16 @@ async def stdio_smoke(config: dict[str, object]) -> None:
                 listed = await session.list_tools()
                 if {tool.name for tool in listed.tools} != TOOL_NAMES:
                     raise RuntimeError("installed stdio server published the wrong tool inventory")
+                for tool in listed.tools:
+                    annotation = tool.annotations
+                    actual = (
+                        annotation.read_only_hint,
+                        annotation.destructive_hint,
+                        annotation.idempotent_hint,
+                        annotation.open_world_hint,
+                    )
+                    if actual != TOOL_ANNOTATIONS[tool.name]:
+                        raise RuntimeError(f"installed {tool.name} published incorrect annotations")
                 initialized = await session.call_tool("initialize_project", {
                     "project_root": str(root), "name": "installed-smoke", "merge": False,
                 })

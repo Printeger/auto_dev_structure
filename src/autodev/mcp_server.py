@@ -232,6 +232,10 @@ def _data_schema(*names: str) -> dict[str, Any]:
         "patch_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "from": {"type": "string"},
         "to": {"type": "string"},
+        "from_status": _CAMPAIGN_RECORD_SCHEMA["properties"]["status"],
+        "to_status": _CAMPAIGN_RECORD_SCHEMA["properties"]["status"],
+        "from_phase": _CAMPAIGN_RECORD_SCHEMA["properties"]["phase"],
+        "to_phase": _CAMPAIGN_RECORD_SCHEMA["properties"]["phase"],
         "action_id": _ACTION_ID,
         "terminal_type": {"enum": ["ASK_HUMAN", "PAUSED", "TARGET_REACHED"]},
         "incomplete_tasks": {"type": "array", "items": {"type": "string"}},
@@ -258,6 +262,7 @@ def _output_schemas() -> dict[str, dict[str, Any]]:
         "answer_blocker": (
             "campaign_id", "task_ids", "admission", "human_approval_request_id",
             "questions", "request_id", "artifact", "checkpoint", "patch_sha256", "from", "to",
+            "from_status", "to_status", "from_phase", "to_phase",
         ),
         "retarget_campaign": ("campaign_id", "from", "to", "action_id", "terminal_type"),
         "materialize_campaign": ("campaign_id", "checkpoint", "patch_sha256", "action_id", "terminal_type"),
@@ -562,10 +567,10 @@ def create_server() -> Any:
             readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
         ),
         "get_next_action": ToolAnnotations(
-            readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
         ),
         "submit_action_result": ToolAnnotations(
-            readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
         ),
     }
     descriptions = {
