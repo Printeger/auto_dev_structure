@@ -128,6 +128,26 @@ class CampaignController:
     def _state(self) -> dict[str, Any]:
         return json.loads((self.canonical / "state.json").read_text(encoding="utf-8"))
 
+    def _reconcile_terminal(self, campaign_id: str, *terminal_types: str) -> CampaignOutcome | None:
+        state = self._state()
+        pending_id = state.get("current_action_id")
+        if pending_id is None:
+            return None
+        try:
+            action = json.loads(
+                (self.canonical / "actions" / str(pending_id) / "action.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            return CampaignOutcome("INFRA_FAILURE", f"cannot reconcile terminal Action: {error}", campaign_id)
+        if action.get("campaign_id") != campaign_id or action.get("type") not in terminal_types:
+            return CampaignOutcome("NOT_READY", "a non-terminal Action is still pending", campaign_id)
+        reconciled = self.control.execute(Command("action.reconcile", {
+            "campaign_id": campaign_id, "terminal_types": list(terminal_types),
+        }))
+        if reconciled.status != "SUCCESS":
+            return CampaignOutcome(reconciled.status, reconciled.message, campaign_id, reconciled.data)
+        return None
+
     @staticmethod
     def _authority_changed(proposal: Mapping[str, Any], contract: Mapping[str, Any]) -> bool:
         approved = contract["authority_envelope"]
@@ -410,6 +430,10 @@ class CampaignController:
     ) -> CampaignOutcome:
         from autodev.human import PersistentHumanInteraction
 
+        reconciled = self._reconcile_terminal(campaign_id, "ASK_HUMAN")
+        if reconciled is not None:
+            return reconciled
+
         try:
             response = PersistentHumanInteraction(self.root).answer(
                 campaign_id, request_id, answers,
@@ -567,6 +591,9 @@ class CampaignController:
         return request_id
 
     def retarget(self, campaign_id: str, target: str) -> CampaignOutcome:
+        reconciled = self._reconcile_terminal(campaign_id, "TARGET_REACHED")
+        if reconciled is not None:
+            return reconciled
         result = self.control.execute(Command("campaign.retarget", {"id": campaign_id, "target": target}))
         return CampaignOutcome(result.status, result.message, campaign_id, result.data)
 
@@ -866,6 +893,9 @@ class CampaignController:
         )
 
     def materialize(self, campaign_id: str) -> CampaignOutcome:
+        reconciled = self._reconcile_terminal(campaign_id, "ASK_HUMAN", "TARGET_REACHED")
+        if reconciled is not None:
+            return reconciled
         state = self._state()
         record = state.get("campaigns", {}).get(campaign_id)
         if record is None:

@@ -219,6 +219,10 @@ class ControlPlane:
                 return self._action_pause(command)
             if command.name == "action.continue":
                 return self._action_continue(command)
+            if command.name == "action.reconcile":
+                return self._action_reconcile(command)
+            if command.name == "debt.record":
+                return self._debt_record(command)
             raise _CommandFailure("INVALID", f"unknown command: {command.name}")
         except _CommandFailure as error:
             revision = self._best_effort_revision()
@@ -1171,6 +1175,94 @@ class ControlPlane:
             return state, {"campaign_id": campaign_id, "cleared_action_id": pending_id}
 
         return self._mutate(command, transform)
+
+    def _action_reconcile(self, command: Command) -> CommandResult:
+        campaign_id = command.arguments.get("campaign_id")
+        allowed_types = command.arguments.get("terminal_types")
+        if not isinstance(allowed_types, list) or not allowed_types or any(
+            item not in {"ASK_HUMAN", "PAUSED", "TARGET_REACHED"} for item in allowed_types
+        ):
+            raise _CommandFailure("INVALID", "terminal reconciliation requires allowed terminal types")
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            pending_id = state.get("current_action_id")
+            if pending_id is None:
+                raise _CommandFailure("NOT_READY", "no terminal Action requires reconciliation")
+            action = self._read_json(
+                self.canonical / "actions" / str(pending_id) / "action.json"
+            )
+            if action.get("campaign_id") != campaign_id or action.get("type") not in allowed_types:
+                raise _CommandFailure("NOT_READY", "pending Action is not an allowed terminal")
+            state["current_action_id"] = None
+            return state, {
+                "campaign_id": campaign_id, "action_id": pending_id,
+                "terminal_type": action["type"],
+            }
+
+        return self._mutate(command, transform)
+
+    def _debt_record(self, command: Command) -> CommandResult:
+        """Validate and persist debt produced by a cumulative Phase Review."""
+
+        campaign_id = command.arguments.get("campaign_id")
+        phase = command.arguments.get("phase")
+        debt_items = command.arguments.get("debt_items")
+        if not isinstance(campaign_id, str) or not isinstance(phase, str):
+            raise _CommandFailure("INVALID", "Phase debt requires campaign_id and phase")
+        if not isinstance(debt_items, list) or not debt_items:
+            raise _CommandFailure("INVALID", "Phase debt requires at least one debt item")
+        grouped: dict[str, list[Mapping[str, Any]]] = {}
+        for item in debt_items:
+            if not isinstance(item, Mapping) or not isinstance(item.get("source_task"), str):
+                raise _CommandFailure("INVALID", "Phase debt item requires source_task")
+            grouped.setdefault(str(item["source_task"]), []).append(item)
+        errors: list[str] = []
+        state = self._state()
+        for task_id, items in grouped.items():
+            record = state.get("tasks", {}).get(task_id)
+            try:
+                contract = self._read_json(self.canonical / "tasks" / task_id / "contract.json")
+            except (FileNotFoundError, json.JSONDecodeError):
+                errors.append(f"{task_id}: unknown debt source Task")
+                continue
+            if (
+                record is None
+                or contract.get("campaign_id") != campaign_id
+                or contract.get("phase") != phase
+            ):
+                errors.append(f"{task_id}: debt source is outside the reviewed Phase")
+                continue
+            errors.extend(f"{task_id}: {item}" for item in validate_debt(contract, items))
+        if errors:
+            raise _CommandFailure(
+                "INVALID", "debt gate rejected Phase Review", data={"errors": errors},
+            )
+
+        def transform(current: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            campaign = current.get("campaigns", {}).get(campaign_id)
+            if campaign is None or campaign.get("phase") != phase:
+                raise _CommandFailure("INVALID", "Phase debt no longer matches current Campaign state")
+            current["last_outcome"] = "PASS_WITH_DEBT"
+            return current, {
+                "campaign_id": campaign_id, "phase": phase,
+                "debt_ids": sorted(str(item["id"]) for item in debt_items),
+            }
+
+        def prepare() -> None:
+            path = self.canonical / "debt.json"
+            try:
+                debt = self._read_json(path)
+            except FileNotFoundError:
+                debt = {"schema_version": 1, "items": []}
+            existing = {item["id"]: item for item in debt.get("items", [])}
+            for item in debt_items:
+                existing[str(item["id"])] = dict(item, status="OPEN")
+            _atomic_replace_json(path, {
+                "schema_version": 1,
+                "items": [existing[key] for key in sorted(existing)],
+            })
+
+        return self._mutate(command, transform, prepare=prepare)
 
     def _task_admit_batch(self, command: Command) -> CommandResult:
         campaign_id = command.arguments.get("campaign_id")

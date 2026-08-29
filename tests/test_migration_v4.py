@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -130,6 +131,63 @@ class V4MigrationTests(unittest.TestCase):
         )
         self.assertEqual(process.returncode, 1)
         self.assertIn("not applicable", process.stdout)
+
+    def test_check_and_apply_preserve_dirty_source_worktree(self) -> None:
+        (self.root / "app.py").write_text("VALUE = 'dirty user edit'\n", encoding="utf-8")
+        (self.root / "user-note.txt").write_text("untracked user data\n", encoding="utf-8")
+        source_before = {
+            "app.py": (self.root / "app.py").read_bytes(),
+            "user-note.txt": (self.root / "user-note.txt").read_bytes(),
+        }
+        status_before = git(self.root, "status", "--short", "--", "app.py", "user-note.txt")
+
+        checked = check_v3_migration(self.root)
+        applied = apply_v3_migration(self.root)
+
+        self.assertEqual(checked.status, "SUCCESS", checked)
+        self.assertEqual(applied.status, "SUCCESS", applied)
+        self.assertEqual(
+            {name: (self.root / name).read_bytes() for name in source_before}, source_before,
+        )
+        self.assertEqual(
+            git(self.root, "status", "--short", "--", "app.py", "user-note.txt"),
+            status_before,
+        )
+
+    def test_atomic_swap_fault_preserves_v3_and_apply_retry_succeeds(self) -> None:
+        canonical = self.root / ".autodev"
+        before = digest_tree(canonical)
+        from autodev import _project
+
+        original_replace = _project.os.replace
+        failed_once = False
+
+        def fail_staging_install(source: object, destination: object) -> None:
+            nonlocal failed_once
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                not failed_once
+                and source_path.name.startswith(".autodev.v4-staging-")
+                and destination_path == canonical
+            ):
+                failed_once = True
+                raise OSError("injected V4 staging install fault")
+            original_replace(source, destination)
+
+        with mock.patch.object(_project.os, "replace", side_effect=fail_staging_install):
+            interrupted = apply_v3_migration(self.root)
+
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        self.assertEqual(digest_tree(canonical), before)
+        self.assertEqual(check_v3_migration(self.root).status, "SUCCESS")
+
+        retried = apply_v3_migration(self.root)
+
+        self.assertEqual(retried.status, "SUCCESS", retried)
+        state = json.loads((canonical / "state.json").read_text())
+        self.assertIsNone(state["current_action_id"])
+        self.assertFalse(state["pause_requested"])
 
 
 if __name__ == "__main__":

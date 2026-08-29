@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -27,10 +26,11 @@ from autodev._workspace import (
     recover_stale_workspaces,
     source_fingerprint,
 )
-from autodev.campaign_workspace import CampaignWorkspace, CampaignWorkspaceError, CheckpointConflict
+from autodev.attempt_lifecycle import AttemptLifecycle
+from autodev.campaign_workspace import CampaignWorkspace, CampaignWorkspaceError
 from autodev.control_plane import Command, ControlPlane
 from autodev.engines import AttemptRequest, EngineResult, ExecutionEngine
-from autodev.quality import QualityDecision, QualityRouter, requires_independent_review, validate_debt
+from autodev.quality import QualityDecision, requires_independent_review
 
 
 def _now() -> str:
@@ -97,7 +97,8 @@ class RunController:
         self.engine = engine
         self.reviewer_engine = reviewer_engine or engine
         self.diagnostic_engine = diagnostic_engine or self.reviewer_engine
-        self.quality = QualityRouter()
+        self.attempts = AttemptLifecycle(self.root)
+        self.quality = self.attempts.quality
         try:
             policy = json.loads((self.canonical / "policy.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -238,31 +239,7 @@ class RunController:
         return result
 
     def _validations(self, contract: dict[str, Any], workspace: Path, artifact_dir: Path) -> list[dict[str, Any]]:
-        results: list[dict[str, Any]] = []
-        for index, validation in enumerate(contract["validation_commands"]):
-            started = time.monotonic()
-            try:
-                process = subprocess.run(
-                    validation["argv"], cwd=workspace / validation["cwd"], shell=False,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                    timeout=validation["timeout"], check=False,
-                )
-                item = {
-                    "index": index, "argv": validation["argv"], "cwd": validation["cwd"],
-                    "returncode": process.returncode, "timed_out": False,
-                    "stdout": process.stdout, "stderr": process.stderr,
-                    "duration_seconds": time.monotonic() - started,
-                }
-            except subprocess.TimeoutExpired as error:
-                item = {
-                    "index": index, "argv": validation["argv"], "cwd": validation["cwd"],
-                    "returncode": None, "timed_out": True,
-                    "stdout": error.stdout or "", "stderr": error.stderr or "",
-                    "duration_seconds": time.monotonic() - started,
-                }
-            results.append(item)
-            _write_json_atomic(artifact_dir / f"validation-{index:02d}.json", item)
-        return results
+        return self.attempts.run_validations(contract, workspace, artifact_dir)
 
     @staticmethod
     def _stagnation_fingerprint(
@@ -410,8 +387,8 @@ class RunController:
         self.control.execute(Command("run.phase", {"run_id": run_id, "to": "VALIDATING"}))
         try:
             policy = json.loads((self.canonical / "policy.json").read_text(encoding="utf-8"))
-            patch, changed_paths = workspace.collect_patch(
-                allowed_paths=contract["allowed_paths"],
+            patch, changed_paths = self.attempts.derive_workspace(
+                run_id=run_id, workspace=worktree, contract=contract,
                 protected_paths=policy.get(
                     "protected_paths",
                     (".autodev/**", ".git/**", ".codex/config.toml", "Second version.md"),
@@ -509,7 +486,10 @@ class RunController:
                     failure_class="agent_task_failure",
                 )
             review = reviewed.proposal
-            if len(review.get("findings", [])) > 5 or len(review.get("debt_items", [])) > 5:
+            if (
+                len(review.get("findings", [])) > self.attempts.budget.max_blocking_findings
+                or len(review.get("debt_items", [])) > self.attempts.budget.max_debt_findings
+            ):
                 workspace.cleanup()
                 return self._finish(run_id, "BLOCKED", proposal={
                     "blocker": "Review finding budget exhausted.",
@@ -531,20 +511,22 @@ class RunController:
 
         outcome = proposal["outcome"]
         if outcome == "PASS_WITH_DEBT":
-            debt_errors = validate_debt(contract, proposal.get("debt_items", []))
+            debt_errors = self.attempts.debt_errors(
+                contract, outcome, {"debt_items": proposal.get("debt_items", [])},
+            )
             if debt_errors:
                 workspace.cleanup()
                 return self._finish(run_id, "REWORK", proposal={"summary": "; ".join(debt_errors)})
-        campaign_checkpoint = None
         if campaign_workspace is None:
             checkpoint_path = workspace.checkpoint(patch, changed_paths)
             checkpoint_id = _hash(checkpoint_path.read_bytes())
         else:
             try:
-                campaign_checkpoint = campaign_workspace.checkpoint(
-                    worktree, task_id=task_id, run_id=run_id,
+                campaign_checkpoint = self.attempts.recover_or_checkpoint(
+                    campaign_id=campaign_id, workspace=worktree,
+                    task_id=task_id, run_id=run_id,
                 )
-            except (CampaignWorkspaceError, CheckpointConflict) as error:
+            except CampaignWorkspaceError as error:
                 workspace.cleanup()
                 return self._finish(
                     run_id, "INFRA_FAILURE", proposal={"summary": str(error)},
@@ -563,19 +545,6 @@ class RunController:
                     {"summary": str(error)}, patch, validations, review, checkpoint_id,
                 )
                 return self._finish(run_id, "INFRA_FAILURE", evidence_id=failure_id, proposal={"summary": str(error)})
-        else:
-            recorded = self.control.execute(Command("campaign.checkpoint", {
-                "id": campaign_id, "checkpoint": checkpoint_id, "task_id": task_id,
-            }))
-            if recorded.status != "SUCCESS":
-                return self._finish(
-                    run_id, "INFRA_FAILURE", evidence_id=evidence_id,
-                    proposal={"summary": recorded.message}, failure_class="checkpoint_journal_pending",
-                )
-            assert campaign_checkpoint is not None
-            campaign_workspace.finalize_checkpoint(
-                campaign_checkpoint, canonical_revision=recorded.revision or 0,
-            )
         workspace.cleanup()
         return self._finish(
             run_id, outcome, evidence_id=evidence_id, checkpoint_id=checkpoint_id, proposal=proposal
