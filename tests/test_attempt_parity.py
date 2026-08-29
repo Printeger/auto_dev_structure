@@ -98,6 +98,24 @@ class AttemptParityTests(unittest.TestCase):
         }
         return {key: evidence[key] for key in fields}
 
+    @staticmethod
+    def canonical_attempt_state(root: Path) -> dict[str, object]:
+        state = json.loads((root / ".autodev/state.json").read_text())
+        campaign = state["campaigns"]["CAMP-001"]
+        return {
+            "project_status": state["project_status"],
+            "task_status": state["tasks"]["TASK-001"]["status"],
+            "last_outcome": state["last_outcome"],
+            "current_run_id": state["current_run_id"],
+            "current_task_id": state["current_task_id"],
+            "current_action_id": state["current_action_id"],
+            "next_owner": state["next_owner"],
+            "next_action": state["next_action"],
+            "blocker": state["blocker"],
+            "campaign_status": campaign["status"],
+            "campaign_phase": campaign["phase"],
+        }
+
     def test_successful_action_and_headless_attempts_share_acceptance_evidence(self) -> None:
         _, action_root = self.project()
         action_controller = ActionController(action_root)
@@ -207,9 +225,17 @@ class AttemptParityTests(unittest.TestCase):
         self.assertEqual([request.role for request in reviewer.requests], ["reviewer"])
         self.assertEqual(reviewer.requests[0].permission_profile, ":read-only")
         self.assertEqual((action_outcome.status, headless_outcome.status), ("SUCCESS", "SUCCESS"))
+        action_evidence = self.evidence(action_root)
+        headless_evidence = self.evidence(headless_root)
         self.assertEqual(
-            self.acceptance_evidence(self.evidence(action_root)),
-            self.acceptance_evidence(self.evidence(headless_root)),
+            self.acceptance_evidence(action_evidence),
+            self.acceptance_evidence(headless_evidence),
+        )
+        self.assertIsNotNone(action_evidence["review_hash"])
+        self.assertEqual(action_evidence["review_hash"], headless_evidence["review_hash"])
+        self.assertEqual(
+            action_evidence["stagnation_fingerprint"],
+            headless_evidence["stagnation_fingerprint"],
         )
 
     def test_both_adapters_enforce_path_and_validation_gates_without_checkpointing(self) -> None:
@@ -236,7 +262,7 @@ class AttemptParityTests(unittest.TestCase):
             ], [{"forbidden.txt": "no\n"}]),
         ).run(RunRequest())
 
-        self.assertEqual((action_path.status, action_path.exit_code), ("INVALID", 1))
+        self.assertEqual((action_path.status, action_path.exit_code), ("NOT_READY", 2))
         self.assertEqual((headless_path.status, headless_path.exit_code), ("NOT_READY", 2))
         self.assertIn("outside-allowed", action_path.message)
         self.assertEqual(
@@ -246,6 +272,21 @@ class AttemptParityTests(unittest.TestCase):
         self.assertEqual(
             json.loads((headless_path_root / ".autodev/state.json").read_text())
             ["campaigns"]["CAMP-001"]["checkpoint"], initial_headless_checkpoint,
+        )
+        for root in (action_path_root, headless_path_root):
+            state = json.loads((root / ".autodev/state.json").read_text())
+            self.assertEqual(state["tasks"]["TASK-001"]["status"], "READY")
+            self.assertEqual(state["last_outcome"], "REWORK")
+            self.assertIsNone(state["current_run_id"])
+            self.assertIsNone(state["current_task_id"])
+            self.assertIsNone(state["current_action_id"])
+        self.assertEqual(
+            self.canonical_attempt_state(action_path_root),
+            self.canonical_attempt_state(headless_path_root),
+        )
+        self.assertEqual(
+            self.acceptance_evidence(self.evidence(action_path_root)),
+            self.acceptance_evidence(self.evidence(headless_path_root)),
         )
 
         _, action_validation_root = self.project()
@@ -267,14 +308,26 @@ class AttemptParityTests(unittest.TestCase):
                 }),
             ], [{"app.py": "VALUE = 3\n"}]),
         ).run(RunRequest())
-        self.assertEqual((action_validation.status, action_validation.exit_code), ("SUCCESS", 0))
-        self.assertEqual(action_validation.action["type"], "EXECUTE_TASK")
+        self.assertEqual(
+            (action_validation.status, action_validation.exit_code), ("NOT_READY", 2),
+        )
+        self.assertIsNone(action_validation.action)
         self.assertEqual(
             (headless_validation.status, headless_validation.exit_code), ("NOT_READY", 2),
         )
         self.assertEqual(
             json.loads((headless_validation_root / ".autodev/state.json").read_text())
             ["last_outcome"], "REWORK",
+        )
+        for root in (action_validation_root, headless_validation_root):
+            state = json.loads((root / ".autodev/state.json").read_text())
+            self.assertEqual(state["tasks"]["TASK-001"]["status"], "READY")
+            self.assertIsNone(state["current_run_id"])
+            self.assertIsNone(state["current_task_id"])
+            self.assertIsNone(state["current_action_id"])
+        self.assertEqual(
+            self.canonical_attempt_state(action_validation_root),
+            self.canonical_attempt_state(headless_validation_root),
         )
         self.assertEqual(
             self.acceptance_evidence(self.evidence(action_validation_root)),
@@ -435,6 +488,70 @@ class AttemptParityTests(unittest.TestCase):
             )
             self.assertEqual(len(journals), 1)
             self.assertEqual(json.loads(journals[0].read_text())["phase"], "COMMITTED")
+
+    def test_committed_checkpoint_before_run_finish_recovers_headless_campaign(self) -> None:
+        from autodev import control_plane
+
+        _, root = self.project()
+        engine = FakeCodexRunner([
+            EngineResult("SUCCESS", {
+                "outcome": "PASS", "summary": "done", "blocker": None,
+                "next_action": None, "findings": [], "debt_items": [],
+            }),
+        ], [{"app.py": "VALUE = 2\n"}])
+        original = control_plane._atomic_replace_json
+        failed_once = False
+
+        def fail_run_finish(path: Path, value: object) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once and path.name == "state.json" and isinstance(value, dict)
+                and value.get("tasks", {}).get("TASK-001", {}).get("status") == "ACCEPTED"
+            ):
+                failed_once = True
+                raise OSError("injected run.finish publication fault")
+            original(path, value)
+
+        with mock.patch.object(
+            control_plane, "_atomic_replace_json", side_effect=fail_run_finish,
+        ):
+            interrupted = CampaignController(root).run_until_target_or_blocked(
+                "CAMP-001", engine,
+            )
+        interrupted_state = json.loads((root / ".autodev/state.json").read_text())
+        journals = list(
+            (root / ".autodev/campaigns/CAMP-001/checkpoint-journal").glob("*.json")
+        )
+        evidence_path = next((root / ".autodev/runs").glob("*/evidence.json"))
+        evidence = json.loads(evidence_path.read_text())
+        evidence_path.write_text(
+            json.dumps({**evidence, "acceptance_hash": "0" * 64}, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        refused = CampaignController(root).run_until_target_or_blocked(
+            "CAMP-001", engine,
+        )
+        evidence_path.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+
+        recovered = CampaignController(root).run_until_target_or_blocked(
+            "CAMP-001", engine,
+        )
+        repeated = CampaignController(root).run_until_target_or_blocked(
+            "CAMP-001", engine,
+        )
+
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        self.assertEqual(interrupted_state["tasks"]["TASK-001"]["status"], "VALIDATING")
+        self.assertEqual(len(journals), 1)
+        self.assertEqual(json.loads(journals[0].read_text())["phase"], "COMMITTED")
+        self.assertEqual(refused.status, "BLOCKED", refused)
+        self.assertEqual(recovered.status, "SUCCESS", recovered)
+        self.assertEqual(repeated.status, "SUCCESS", repeated)
+        final_state = json.loads((root / ".autodev/state.json").read_text())
+        self.assertEqual(final_state["tasks"]["TASK-001"]["status"], "ACCEPTED")
+        self.assertEqual(final_state["campaigns"]["CAMP-001"]["status"], "TARGET_REACHED")
+        self.assertEqual(len(engine.requests), 1)
 
 
 if __name__ == "__main__":

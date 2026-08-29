@@ -238,7 +238,14 @@ class AttemptLifecycle:
         if result is not None:
             evidence["result_hash"] = canonical_hash(result)
         if review is not None:
-            evidence["review_hash"] = canonical_hash(review)
+            evidence["review_hash"] = canonical_hash({
+                "outcome": review.get("outcome"),
+                "summary": review.get("summary"),
+                "blocker": review.get("blocker"),
+                "next_action": review.get("next_action"),
+                "findings": review.get("findings", []),
+                "debt_items": debt_items,
+            })
         else:
             evidence["review_hash"] = None
         if extra:
@@ -247,6 +254,76 @@ class AttemptLifecycle:
         evidence["evidence_id"] = evidence_id
         _write_json_atomic(run_dir / "evidence.json", evidence)
         return evidence_id, evidence
+
+    def reconcile_accepted_checkpoint(
+        self, campaign_id: str, journal: Mapping[str, Any] | None = None,
+    ) -> int | None:
+        """Finish a current Run whose private checkpoint and evidence are durable."""
+
+        state = json.loads((self.canonical / "state.json").read_text(encoding="utf-8"))
+        run_id = state.get("current_run_id")
+        task_id = state.get("current_task_id")
+        if not isinstance(run_id, str) or not isinstance(task_id, str):
+            return None
+        owner = CampaignWorkspace(self.root, campaign_id)
+        if journal is None:
+            path = owner.journals / f"{run_id}.json"
+            if not path.is_file():
+                return None
+            journal = json.loads(path.read_text(encoding="utf-8"))
+        if journal.get("run_id") != run_id or journal.get("task_id") != task_id:
+            return None
+        if journal.get("phase") not in {"REF_UPDATED", "COMMITTED"}:
+            return None
+        commit = str(journal.get("commit", ""))
+        campaign = state.get("campaigns", {}).get(campaign_id, {})
+        if campaign.get("checkpoint") != commit or owner.current_commit != commit:
+            raise CampaignWorkspaceError(
+                "durable checkpoint does not match canonical Campaign state and private ref"
+            )
+        try:
+            evidence = json.loads(
+                (self.canonical / "runs" / run_id / "evidence.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise CampaignWorkspaceError(
+                f"checkpoint exists without provable acceptance evidence: {error}"
+            ) from error
+        acceptance_fields = (
+            "schema_version", "task_id", "outcome", "contract_gate_hash", "diff_hash",
+            "changed_paths", "validations", "quality_route", "findings", "debt_items",
+        )
+        acceptance = {field: evidence.get(field) for field in acceptance_fields}
+        contract_record = state.get("tasks", {}).get(task_id, {})
+        try:
+            contract = self.load_contract(
+                f"tasks/{task_id}/contract.json", str(contract_record["contract_hash"]),
+            )
+        except (KeyError, OSError, json.JSONDecodeError, ValueError) as error:
+            raise CampaignWorkspaceError(
+                f"checkpoint contract cannot prove Task acceptance: {error}"
+            ) from error
+        expected_evidence_id = f"EVIDENCE-{canonical_hash({
+            key: value for key, value in evidence.items() if key != 'evidence_id'
+        })}"
+        if (
+            evidence.get("run_id") != run_id
+            or evidence.get("task_id") != task_id
+            or evidence.get("checkpoint_id") != commit
+            or evidence.get("outcome") not in {"PASS", "PASS_WITH_DEBT"}
+            or evidence.get("contract_gate_hash") != self.contract_gate_hash(contract)
+            or evidence.get("evidence_id") != expected_evidence_id
+            or evidence.get("acceptance_hash") != canonical_hash(acceptance)
+        ):
+            raise CampaignWorkspaceError("checkpoint evidence does not prove Task acceptance")
+        finished = self.finish(
+            run_id=run_id, outcome=str(evidence["outcome"]),
+            evidence_id=str(evidence["evidence_id"]), checkpoint_id=commit,
+            result={"debt_items": evidence.get("debt_items", [])},
+        )
+        if finished.status != "SUCCESS":
+            raise CampaignWorkspaceError(finished.message)
+        return finished.revision
 
     def recover_or_checkpoint(
         self, *, campaign_id: str, workspace: Path, task_id: str, run_id: str,

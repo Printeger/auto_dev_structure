@@ -997,31 +997,12 @@ class CampaignController:
             }))
             if result.status != "SUCCESS":
                 raise CampaignWorkspaceError(result.message)
-            current = self._state()
-            if current.get("current_run_id") == journal["run_id"]:
-                evidence_path = self.canonical / "runs" / journal["run_id"] / "evidence.json"
-                try:
-                    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as error:
-                    raise CampaignWorkspaceError(
-                        f"checkpoint exists without provable acceptance evidence: {error}"
-                    ) from error
-                if (
-                    evidence.get("checkpoint_id") != journal["commit"]
-                    or evidence.get("outcome") not in {"PASS", "PASS_WITH_DEBT"}
-                ):
-                    raise CampaignWorkspaceError("checkpoint evidence does not prove Task acceptance")
-                finished = self.attempts.finish(
-                    run_id=journal["run_id"], outcome=evidence["outcome"],
-                    evidence_id=evidence["evidence_id"], checkpoint_id=journal["commit"],
-                )
-                if finished.status != "SUCCESS":
-                    raise CampaignWorkspaceError(finished.message)
-                return finished.revision or result.revision or 0
-            return result.revision or 0
+            reconciled = self.attempts.reconcile_accepted_checkpoint(campaign_id, journal)
+            return reconciled or result.revision or 0
 
         try:
             workspace.recover_checkpoints(record_recovered)
+            self.attempts.reconcile_accepted_checkpoint(campaign_id)
         except CampaignWorkspaceError as error:
             return CampaignOutcome("BLOCKED", f"checkpoint recovery blocked: {error}", campaign_id)
         for _ in range(max_iterations):

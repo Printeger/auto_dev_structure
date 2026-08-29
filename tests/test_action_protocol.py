@@ -520,22 +520,22 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertEqual(controller.submit_action_result(action["id"], conflicting).status, "INVALID")
         self.assertEqual(self.snapshot(), after)
 
-    def test_worker_path_and_concurrent_source_changes_are_rejected_without_core_mutation(self) -> None:
+    def test_worker_path_rejection_resolves_rework_while_concurrent_source_is_zero_mutation(self) -> None:
         campaign_id = self.approve()
         controller = ActionController(self.root)
         action = dict(controller.get_next_action(campaign_id).action or {})
         workspace = Path(action["workspace"])
         workspace.joinpath("outside.txt").write_text("not allowed\n", encoding="utf-8")
-        before = self.snapshot()
-
         rejected = controller.submit_action_result(action["id"], self.passing_result(action))
 
-        self.assertEqual(rejected.status, "INVALID", rejected)
+        self.assertEqual(rejected.status, "NOT_READY", rejected)
         self.assertIn("outside-allowed", rejected.message)
-        self.assertEqual(self.snapshot(), before)
+        state = json.loads((self.root / ".autodev/state.json").read_text())
+        self.assertEqual(state["tasks"]["TASK-001"]["status"], "READY")
+        self.assertEqual(state["last_outcome"], "REWORK")
 
-        workspace.joinpath("outside.txt").unlink()
-        workspace.joinpath("app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        action = dict(controller.get_next_action(campaign_id).action or {})
+        Path(action["workspace"]).joinpath("app.py").write_text("VALUE = 2\n", encoding="utf-8")
         self.root.joinpath("user-note.txt").write_text("concurrent\n", encoding="utf-8")
         before_concurrent = self.snapshot()
 
@@ -545,28 +545,32 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertIn("source changed concurrently", concurrent.message)
         self.assertEqual(self.snapshot(), before_concurrent)
 
-    def test_worker_rework_and_blocked_results_still_enforce_actual_path_policy(self) -> None:
+    def test_worker_rework_and_blocked_results_are_overridden_by_actual_path_policy(self) -> None:
         campaign_id = self.approve()
         controller = ActionController(self.root)
         action = dict(controller.get_next_action(campaign_id).action or {})
         Path(action["workspace"]).joinpath("forbidden.txt").write_text("forbidden\n", encoding="utf-8")
         rework = self.passing_result(action)
         rework["outcome"] = "REWORK"
-        before = self.snapshot()
-
         rejected_rework = controller.submit_action_result(action["id"], rework)
 
-        self.assertEqual(rejected_rework.status, "INVALID", rejected_rework)
+        self.assertEqual(rejected_rework.status, "NOT_READY", rejected_rework)
         self.assertIn("outside-allowed", rejected_rework.message)
-        self.assertEqual(self.snapshot(), before)
+        action = dict(controller.get_next_action(campaign_id).action or {})
+        Path(action["workspace"]).joinpath("forbidden.txt").write_text(
+            "forbidden\n", encoding="utf-8",
+        )
         blocked = self.passing_result(action)
         blocked.update(
             outcome="BLOCKED", blocker="External credential is unavailable.",
             next_action="Provide the credential.",
         )
         rejected_blocked = controller.submit_action_result(action["id"], blocked)
-        self.assertEqual(rejected_blocked.status, "INVALID", rejected_blocked)
-        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(rejected_blocked.status, "NOT_READY", rejected_blocked)
+        self.assertIn("outside-allowed", rejected_blocked.message)
+        state = json.loads((self.root / ".autodev/state.json").read_text())
+        self.assertEqual(state["tasks"]["TASK-001"]["status"], "READY")
+        self.assertEqual(state["last_outcome"], "REWORK")
 
     def test_quality_router_requires_fresh_read_only_immediate_review(self) -> None:
         campaign_id = self.approve(task(risk="HIGH"))
@@ -1036,8 +1040,8 @@ class ActionProtocolTests(unittest.TestCase):
         Path(first["workspace"]).joinpath("app.py").write_text("VALUE = 3\n", encoding="utf-8")
 
         second_outcome = controller.submit_action_result(first["id"], self.passing_result(first))
-        self.assertEqual(second_outcome.status, "SUCCESS", second_outcome)
-        second = dict(second_outcome.action or {})
+        self.assertEqual(second_outcome.status, "NOT_READY", second_outcome)
+        second = dict(controller.get_next_action(campaign_id).action or {})
         self.assertEqual(second["type"], "EXECUTE_TASK")
         Path(second["workspace"]).joinpath("app.py").write_text("VALUE = 3\n", encoding="utf-8")
         diagnostic_outcome = controller.submit_action_result(

@@ -580,7 +580,9 @@ class ActionController:
                 ),
             )
         except (PatchPolicyViolation, OSError, RuntimeError) as error:
-            return ActionOutcome("INVALID", f"workspace policy rejected result: {error}")
+            return self._reject_worker_attempt(
+                action, result, f"workspace policy rejected result: {error}",
+            )
         if result["outcome"] not in {"PASS", "PASS_WITH_DEBT"}:
             return self._finish_nonpassing(action, result, patch, changed_paths)
         if not patch:
@@ -624,6 +626,33 @@ class ActionController:
             )
             return review
         return self._accept_changes(action, result, patch, changed_paths, validations)
+
+    def _reject_worker_attempt(
+        self, action: dict[str, Any], submitted_result: dict[str, Any], message: str,
+    ) -> ActionOutcome:
+        """Resolve a valid submission rejected by a Core-derived trust gate."""
+
+        run_id = str(action["context"]["run_id"])
+        evidence_result = {
+            **submitted_result, "outcome": "REWORK", "summary": message,
+            "blocker": None, "next_action": None,
+        }
+        evidence_id = self._write_evidence(
+            action, evidence_result, b"", [], [], None,
+            action_result=submitted_result,
+        )
+        finished = self._attempts.finish(
+            run_id=run_id, outcome="REWORK", evidence_id=evidence_id,
+        )
+        if finished.status != "SUCCESS":
+            return ActionOutcome(finished.status, finished.message, data=finished.data)
+        resolved = self._resolve(
+            action, submitted_result, ActionOutcome("NOT_READY", message),
+        )
+        if resolved.status != "NOT_READY":
+            return resolved
+        cleanup = self._safe_cleanup(str(action["campaign_id"]), Path(action["workspace"]))
+        return cleanup or resolved
 
     def _resolve_validation_failure(
         self, action: dict[str, Any], result: dict[str, Any], patch: bytes,
@@ -674,16 +703,13 @@ class ActionController:
             and not diagnostic_used
         ):
             final = self._create_diagnostic(action, Path(action["workspace"]), failure)
-        else:
-            CampaignWorkspace(self._root, str(action["campaign_id"])).remove_task_workspace(
-                Path(action["workspace"])
+            _write_json_atomic(
+                self._canonical / "actions" / action["id"] / "outcome.json",
+                self._outcome_dict(final),
             )
-            final = self.get_next_action(str(action["campaign_id"]))
-        _write_json_atomic(
-            self._canonical / "actions" / action["id"] / "outcome.json",
-            self._outcome_dict(final),
-        )
-        return final
+            return final
+        cleanup = self._safe_cleanup(str(action["campaign_id"]), Path(action["workspace"]))
+        return cleanup or resolved
 
     def _create_diagnostic(
         self, worker: Mapping[str, Any], workspace: Path, failure: Mapping[str, Any],
@@ -810,7 +836,7 @@ class ActionController:
         }
         return self._accept_changes(
             action, worker_result, patch, changed_paths, list(attempt["validations"]),
-            submitted_result=result,
+            submitted_result=result, review_result=result,
         )
 
     def _submit_phase_review(
@@ -950,6 +976,7 @@ class ActionController:
         self, action: dict[str, Any], result: dict[str, Any], patch: bytes,
         changed_paths: list[str], validations: list[dict[str, Any]],
         *, submitted_result: dict[str, Any] | None = None,
+        review_result: Mapping[str, Any] | None = None,
     ) -> ActionOutcome:
         workspace = Path(action["workspace"]).resolve()
         run_id = str(action["context"]["run_id"])
@@ -971,7 +998,7 @@ class ActionController:
             nonlocal evidence_id
             evidence_id = self._write_evidence(
                 action, result, patch, changed_paths, validations, checkpoint.commit,
-                action_result=submitted_result or result,
+                action_result=submitted_result or result, review=review_result,
             )
 
         try:
@@ -1065,6 +1092,7 @@ class ActionController:
         outcome = result["outcome"]
         evidence_id = self._write_evidence(
             action, result, patch or b"", changed_paths or [], [], None,
+            review=result if action.get("role") == "reviewer" else None,
         )
         finished = self._attempts.finish(
             run_id=run_id, outcome=outcome, evidence_id=evidence_id, result=result,
@@ -1098,6 +1126,7 @@ class ActionController:
         self, action: Mapping[str, Any], result: Mapping[str, Any], patch: bytes,
         changed_paths: list[str], validations: list[dict[str, Any]], checkpoint: str | None,
         *, action_result: Mapping[str, Any] | None = None,
+        review: Mapping[str, Any] | None = None,
     ) -> str:
         run_id = str(action["context"]["run_id"])
         evidence_id, _ = self._attempts.write_evidence(
@@ -1105,7 +1134,7 @@ class ActionController:
             task_id=str(action["task_id"]), run_id=run_id, outcome=str(result["outcome"]),
             contract=self._contract_for(action), patch=patch, changed_paths=changed_paths,
             validations=validations, quality_route=str(action["quality_route"]),
-            checkpoint_id=checkpoint, result=result,
+            checkpoint_id=checkpoint, result=result, review=review,
             extra={
                 "action_id": action["id"],
                 "action_result_hash": _hash(action_result or result),
