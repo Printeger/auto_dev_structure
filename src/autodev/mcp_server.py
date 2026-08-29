@@ -131,6 +131,14 @@ _ACTION_CONTEXT_SCHEMA = _object(
         "blocker": {"type": ["string", "null"]},
         "next_action": {"type": ["string", "null"]},
         "request_id": {"type": "string"},
+        "human_request_ref": {"type": "string"},
+        "answers": {
+            "type": "array",
+            "items": _object({
+                "question_id": {"type": "string"},
+                "values": {"type": "array", "items": {"type": "string"}},
+            }, ["question_id", "values"]),
+        },
         "questions": {"type": "array", "items": _HUMAN_QUESTION_SCHEMA},
         "answer_contract": _ANSWER_CONTRACT_SCHEMA,
     },
@@ -145,7 +153,7 @@ _VALIDATION_SCHEMA = _object(
         "index": {"type": "integer"},
         "argv": {"type": "array", "items": {"type": "string"}},
         "cwd": {"type": "string"},
-        "returncode": {"type": "integer"},
+        "returncode": {"type": ["integer", "null"]},
         "timed_out": {"type": "boolean"},
         "stdout": {"type": "string"},
         "stderr": {"type": "string"},
@@ -230,6 +238,7 @@ def _data_schema(*names: str) -> dict[str, Any]:
         "graceful": {"type": "boolean"},
         "cleared_action_id": {"type": ["string", "null"]},
         "patch_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "applied": {"type": "boolean"},
         "from": {"type": "string"},
         "to": {"type": "string"},
         "from_status": _CAMPAIGN_RECORD_SCHEMA["properties"]["status"],
@@ -265,7 +274,9 @@ def _output_schemas() -> dict[str, dict[str, Any]]:
             "from_status", "to_status", "from_phase", "to_phase",
         ),
         "retarget_campaign": ("campaign_id", "from", "to", "action_id", "terminal_type"),
-        "materialize_campaign": ("campaign_id", "checkpoint", "patch_sha256", "action_id", "terminal_type"),
+        "materialize_campaign": (
+            "campaign_id", "checkpoint", "patch_sha256", "applied", "action_id", "terminal_type",
+        ),
         "get_next_action": ("incomplete_tasks", "validations", "findings"),
         "submit_action_result": ("validations", "findings", "incomplete_tasks"),
     }
@@ -564,7 +575,7 @@ def create_server() -> Any:
             readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
         ),
         "materialize_campaign": ToolAnnotations(
-            readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
+            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
         ),
         "get_next_action": ToolAnnotations(
             readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,

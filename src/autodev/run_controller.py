@@ -98,7 +98,6 @@ class RunController:
         self.reviewer_engine = reviewer_engine or engine
         self.diagnostic_engine = diagnostic_engine or self.reviewer_engine
         self.attempts = AttemptLifecycle(self.root)
-        self.quality = self.attempts.quality
         try:
             policy = json.loads((self.canonical / "policy.json").read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -381,7 +380,7 @@ class RunController:
                 (self.canonical / "runs" / str(item.get("run_id")) / "diagnostic.json").is_file()
                 for item in history
             )
-            if self.quality.decide(
+            if self.attempts.decide_quality(
                 contract, failure_fingerprints=fingerprints, diagnostic_used=diagnostic_used,
             ) == QualityDecision.DIAGNOSTIC:
                 diagnostic_context = {
@@ -416,7 +415,7 @@ class RunController:
             return self._finish(run_id, outcome, evidence_id=evidence_id, proposal=proposal)
 
         review: dict[str, Any] | None = None
-        quality_decision = self.quality.decide(contract)
+        quality_decision = self.attempts.decide_quality(contract)
         immediate_review = (
             quality_decision == QualityDecision.IMMEDIATE
             if campaign_id else requires_independent_review(contract, rework_count=reworks)

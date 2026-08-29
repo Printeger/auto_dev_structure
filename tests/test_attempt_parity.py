@@ -78,7 +78,8 @@ class AttemptParityTests(unittest.TestCase):
     @staticmethod
     def action_result(action: dict[str, object]) -> dict[str, object]:
         return {
-            "action_id": action["id"], "canonical_revision": action["canonical_revision"],
+            "action_id": action["id"], "action_type": action["type"],
+            "canonical_revision": action["canonical_revision"],
             "outcome": "PASS", "summary": "done", "data": {}, "findings": [],
             "blocker": None, "next_action": None,
         }

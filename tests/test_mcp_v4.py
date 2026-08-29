@@ -295,7 +295,7 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
             "pause_campaign": (False, False, False, False),
             "answer_blocker": (False, True, True, False),
             "retarget_campaign": (False, True, True, False),
-            "materialize_campaign": (False, True, False, False),
+            "materialize_campaign": (False, True, True, False),
             "get_next_action": (False, True, True, False),
             "submit_action_result": (False, True, True, False),
         }
@@ -405,6 +405,7 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(paused.is_error, paused)
             result = {
                 "action_id": action["id"],
+                "action_type": action["type"],
                 "canonical_revision": action["canonical_revision"],
                 "outcome": "PASS",
                 "summary": "Implemented and verified.",
@@ -451,6 +452,62 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
             })
             self.assertEqual(planning.structured_content["action"]["type"], "PLAN_PHASE")
             self.assertFalse(self.codex_sentinel.exists())
+
+    async def test_timeout_validation_output_matches_the_advertised_schema(self) -> None:
+        async with self.session() as session:
+            await session.call_tool("initialize_project", {
+                "project_root": str(self.root), "name": "timeout-flow", "merge": False,
+            })
+            (self.root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            git(self.root, "add", ".")
+            git(self.root, "commit", "-qm", "base")
+            timed_proposal = proposal()
+            timed_proposal["tasks"][0]["validation_commands"] = [{
+                "argv": ["python3", "-c", "import time; time.sleep(2)"],
+                "cwd": ".", "timeout": 1,
+            }]
+            proposed = await session.call_tool("propose_campaign", {
+                "project_root": str(self.root), "idea": "Timeout validation",
+                "development_strategy": "CHANGE", "target": "CHANGE_COMPLETE",
+                "autonomy": "HUMAN_ON_BLOCKED", "proposal": timed_proposal,
+            })
+            campaign_id = proposed.structured_content["campaign_id"]
+            await session.call_tool("approve_campaign", {
+                "project_root": str(self.root), "campaign_id": campaign_id,
+                "proposal_hash": proposed.structured_content["data"]["proposal_hash"],
+                "proposal_and_authority_confirmed": True,
+            })
+            pending = await session.call_tool("get_next_action", {
+                "project_root": str(self.root), "campaign_id": campaign_id,
+            })
+            action = pending.structured_content["action"]
+            Path(action["workspace"]).joinpath("app.py").write_text(
+                "VALUE = 2\n", encoding="utf-8",
+            )
+            result = {
+                "action_id": action["id"],
+                "action_type": action["type"],
+                "canonical_revision": action["canonical_revision"],
+                "outcome": "PASS", "summary": "Implemented.", "data": {},
+                "findings": [], "blocker": None, "next_action": None,
+            }
+
+            timed_out = await session.call_tool("submit_action_result", {
+                "project_root": str(self.root), "action_id": action["id"], "result": result,
+            })
+            listed = await session.list_tools()
+            schema = next(
+                tool.output_schema for tool in listed.tools
+                if tool.name == "submit_action_result"
+            )
+
+        self.assertEqual(timed_out.structured_content["status"], "NOT_READY")
+        validation = timed_out.structured_content["data"]["validations"][0]
+        self.assertTrue(validation["timed_out"])
+        self.assertIsNone(validation["returncode"])
+        self.assertFalse(list(
+            Draft202012Validator(schema).iter_errors(timed_out.structured_content)
+        ))
 
     async def test_blocked_campaign_status_and_answer(self) -> None:
         async with self.session() as session:

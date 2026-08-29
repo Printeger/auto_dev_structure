@@ -254,7 +254,26 @@ class CampaignWorkspace:
         target = self.current_commit
         expected = _fingerprint_from(baseline["source_fingerprint"])
         actual = source_fingerprint(self.root)
+        journal_path = self.campaign_dir / "materialization-journal.json"
+        if (
+            baseline.get("last_materialized_commit") == target
+            and actual.digest == expected.digest
+            and journal_path.is_file()
+        ):
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+            if journal.get("phase") == "COMMITTED" and journal.get("to_commit") == target:
+                return MaterializationResult(
+                    self.campaign_id, str(journal["from_commit"]), target,
+                    str(journal["patch_sha256"]), bool(journal.get("applied", True)), journal_path,
+                )
         if actual.digest != expected.digest:
+            _write_json_atomic(journal_path, {
+                "schema_version": 1, "campaign_id": self.campaign_id,
+                "from_commit": source, "to_commit": target,
+                "source_fingerprint": expected.to_dict(),
+                "observed_source_fingerprint": actual.to_dict(),
+                "phase": "CONFLICT",
+            })
             raise MaterializationConflict(
                 f"source changed: expected {expected.digest}, found {actual.digest}"
             )
@@ -265,7 +284,6 @@ class CampaignWorkspace:
             raise CampaignWorkspaceError(diff.stderr.decode(errors="replace").strip())
         patch = diff.stdout
         patch_hash = hashlib.sha256(patch).hexdigest()
-        journal_path = self.campaign_dir / "materialization-journal.json"
         journal = {
             "schema_version": 1,
             "campaign_id": self.campaign_id,
@@ -273,6 +291,7 @@ class CampaignWorkspace:
             "to_commit": target,
             "patch_sha256": patch_hash,
             "source_fingerprint": expected.to_dict(),
+            "applied": bool(patch),
             "phase": "PREPARED",
         }
         _write_json_atomic(journal_path, journal)

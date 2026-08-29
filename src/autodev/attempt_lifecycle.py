@@ -6,19 +6,19 @@ import hashlib
 import json
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from autodev._workspace import GitWorkspace, _write_json_atomic
+from autodev._workspace import GitWorkspace, _write_json_atomic, source_fingerprint
 from autodev.campaign_workspace import (
     CampaignWorkspace,
     CampaignWorkspaceError,
     CheckpointResult,
 )
 from autodev.control_plane import Command, CommandResult, ControlPlane
-from autodev.quality import QualityBudget, QualityRouter, validate_debt
+from autodev.quality import QualityBudget, QualityDecision, QualityRouter, validate_debt
 
 
 def canonical_hash(value: Any) -> str:
@@ -54,6 +54,46 @@ class AttemptLifecycle:
         if canonical_hash(contract) != expected_hash:
             raise ValueError("frozen Task contract hash mismatch")
         return contract
+
+    @staticmethod
+    def workspace_fingerprint(workspace: Path) -> str:
+        """Identify a workspace including clean commits and an attached ref, if any."""
+
+        def git_output(*arguments: str, allowed: frozenset[int] = frozenset({0})) -> bytes:
+            process = subprocess.run(
+                ["git", *arguments], cwd=workspace, check=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            if process.returncode not in allowed:
+                raise CampaignWorkspaceError(
+                    process.stderr.decode(errors="replace").strip()
+                    or f"git {' '.join(arguments)} failed"
+                )
+            return process.stdout
+
+        head = git_output("rev-parse", "--verify", "HEAD")
+        symbolic_ref = git_output(
+            "symbolic-ref", "-q", "HEAD", allowed=frozenset({0, 1}),
+        )
+        ref_commit = b""
+        if symbolic_ref.strip():
+            ref_commit = git_output("rev-parse", "--verify", symbolic_ref.decode().strip())
+        status = git_output("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        diff = git_output("diff", "--binary", "--full-index", "HEAD", "--")
+        return hashlib.sha256(
+            b"HEAD\0" + head + b"REF\0" + symbolic_ref + ref_commit
+            + b"STATUS\0" + status + b"DIFF\0" + diff
+        ).hexdigest()
+
+    def read_only_violation(
+        self, *, workspace: Path, expected_workspace: str,
+        expected_source: str,
+    ) -> str | None:
+        if self.workspace_fingerprint(workspace) != expected_workspace:
+            return "modified its workspace"
+        if source_fingerprint(self.root).digest != expected_source:
+            return "source changed concurrently"
+        return None
 
     def derive_workspace(
         self, *, run_id: str, workspace: Path, contract: Mapping[str, Any],
@@ -116,6 +156,17 @@ class AttemptLifecycle:
         if len(debt_items) > self.budget.max_debt_findings:
             errors.append("Review exceeded the debt finding budget")
         return errors
+
+    def decide_quality(
+        self, contract: Mapping[str, Any], *,
+        failure_fingerprints: Sequence[str] = (), diagnostic_used: bool = False,
+    ) -> QualityDecision:
+        """Return the single quality route used by every attempt adapter."""
+
+        return self.quality.decide(
+            contract, failure_fingerprints=failure_fingerprints,
+            diagnostic_used=diagnostic_used,
+        )
 
     def finish(
         self, *, run_id: str, outcome: str, evidence_id: str | None = None,

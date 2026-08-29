@@ -13,6 +13,7 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE_ROOT / "src"))
 
 from autodev._project import initialize_project
+from autodev.action import ActionController
 from autodev.campaign import CampaignController, CampaignRequest, FakePlanner
 from autodev.control_plane import Command, ControlPlane
 from autodev.engines import EngineResult, FakeCodexRunner
@@ -326,17 +327,84 @@ class CampaignControllerTests(unittest.TestCase):
         state = json.loads((self.root / ".autodev/state.json").read_text())
         self.assertEqual(state["project_status"], "BLOCKED")
         self.assertEqual(state["campaigns"]["CAMP-001"]["status"], "TARGET_REACHED")
+        conflict_journal = json.loads(
+            (self.root / ".autodev/campaigns/CAMP-001/materialization-journal.json").read_text()
+        )
+        self.assertEqual(conflict_journal["phase"], "CONFLICT")
+        asking = ActionController(self.root).get_next_action("CAMP-001")
+        self.assertEqual(asking.action["type"], "ASK_HUMAN")
+        request_id = asking.action["context"]["request_id"]
+        blocker_context = json.loads(
+            (self.root / ".autodev/campaigns/CAMP-001/blocker-context.json").read_text()
+        )
+        self.assertEqual(blocker_context["kind"], "materialization-conflict")
         (self.root / "user.txt").unlink()
         retried = controller.materialize("CAMP-001")
         self.assertEqual(retried.status, "SUCCESS", retried)
         state = json.loads((self.root / ".autodev/state.json").read_text())
         self.assertEqual(state["project_status"], "IDLE")
+        self.assertIsNone(state["current_action_id"])
+        request = json.loads(
+            (self.root / f".autodev/campaigns/CAMP-001/human-requests/{request_id}.json").read_text()
+        )
+        self.assertEqual(request["status"], "AUTO_RESOLVED")
+        self.assertEqual(request["answers"], {"resolution": ["Retry Campaign"]})
+        resolved_context = json.loads(
+            (self.root / ".autodev/campaigns/CAMP-001/blocker-context.json").read_text()
+        )
+        self.assertEqual(resolved_context["status"], "RESOLVED")
+        revision = state["revision"]
+        committed_journal = (
+            self.root / ".autodev/campaigns/CAMP-001/materialization-journal.json"
+        ).read_bytes()
+        repeated = controller.materialize("CAMP-001")
+        self.assertEqual(repeated.status, "SUCCESS", repeated)
+        self.assertEqual(json.loads((self.root / ".autodev/state.json").read_text())["revision"], revision)
+        self.assertEqual(
+            (self.root / ".autodev/campaigns/CAMP-001/materialization-journal.json").read_bytes(),
+            committed_journal,
+        )
         checkpoint = state["campaigns"]["CAMP-001"]["checkpoint"]
         retargeted = controller.retarget("CAMP-001", "WORKING_MVP")
         self.assertEqual(retargeted.status, "SUCCESS", retargeted)
         state = json.loads((self.root / ".autodev/state.json").read_text())
         self.assertEqual(state["campaigns"]["CAMP-001"]["phase"], "IMPLEMENT")
         self.assertEqual(state["campaigns"]["CAMP-001"]["checkpoint"], checkpoint)
+
+    def test_materialize_does_not_reconcile_an_unrelated_human_request(self) -> None:
+        only_task = task()
+        only_task["validation_commands"] = [
+            {"argv": ["python3", "-c", "pass"], "cwd": ".", "timeout": 10},
+        ]
+        controller = CampaignController(self.root, FakePlanner([proposal([only_task])]))
+        planned = controller.plan(CampaignRequest("Build", target="ARCHITECTURE_BASELINE"))
+        self.assertEqual(controller.approve("CAMP-001", planned.data["proposal_hash"]).status, "SUCCESS")
+        passed = EngineResult("SUCCESS", {
+            "outcome": "PASS", "summary": "done", "blocker": None,
+            "next_action": None, "findings": [], "debt_items": [],
+        })
+        self.assertEqual(RunController(
+            self.root, FakeCodexRunner([passed], [{"app.py": "VALUE = 2\n"}]),
+        ).run(RunRequest()).status, "SUCCESS")
+        reached = ControlPlane(self.root).execute(Command("campaign.transition", {
+            "id": "CAMP-001", "status": "TARGET_REACHED", "phase": "TARGET_REACHED",
+        }))
+        self.assertEqual(reached.status, "SUCCESS", reached)
+        blocked = ControlPlane(self.root).execute(Command("project.transition", {
+            "to": "BLOCKED", "blocker": "An unrelated external approval is missing.",
+            "next_action": "Obtain the external approval.",
+        }))
+        self.assertEqual(blocked.status, "SUCCESS", blocked)
+        asking = ActionController(self.root).get_next_action("CAMP-001")
+        self.assertEqual(asking.action["type"], "ASK_HUMAN")
+        before_id = asking.action["id"]
+
+        refused = controller.materialize("CAMP-001")
+
+        self.assertEqual(refused.status, "NOT_READY", refused)
+        state = json.loads((self.root / ".autodev/state.json").read_text())
+        self.assertEqual(state["current_action_id"], before_id)
+        self.assertEqual(ActionController(self.root).get_next_action("CAMP-001").action, asking.action)
 
     def test_archive_refuses_active_campaign_without_deleting_private_ref(self) -> None:
         controller = CampaignController(self.root, FakePlanner([proposal([task()])]))

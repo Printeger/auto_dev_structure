@@ -31,7 +31,7 @@ TOOL_ANNOTATIONS = {
     "pause_campaign": (False, False, False, False),
     "answer_blocker": (False, True, True, False),
     "retarget_campaign": (False, True, True, False),
-    "materialize_campaign": (False, True, False, False),
+    "materialize_campaign": (False, True, True, False),
     "get_next_action": (False, True, True, False),
     "submit_action_result": (False, True, True, False),
 }

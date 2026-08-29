@@ -124,7 +124,6 @@ class CampaignController:
         self.planner = planner
         self.interaction = interaction
         self.attempts = AttemptLifecycle(self.root)
-        self.quality = self.attempts.quality
 
     def _state(self) -> dict[str, Any]:
         return json.loads((self.canonical / "state.json").read_text(encoding="utf-8"))
@@ -311,6 +310,7 @@ class CampaignController:
 
     def _request_planner_questions(
         self, campaign_id: str, questions: Sequence[Mapping[str, Any]],
+        *, request_id: str | None = None,
     ) -> CampaignOutcome:
         from autodev.human import (
             HumanOption, HumanQuestion, HumanRequest, HumanResponse,
@@ -326,18 +326,30 @@ class CampaignController:
                           for option in item.get("options", [])),
                     bool(item.get("isOther", True)), bool(item.get("isSecret", False)),
                 ) for item in questions),
+                **({"request_id": request_id} if request_id is not None else {}),
             )
         except (KeyError, TypeError, ValueError) as error:
             return CampaignOutcome("INVALID", f"invalid Planner questions: {error}", campaign_id)
         persistent = PersistentHumanInteraction(self.root)
         pending = persistent.request(request)
         response = self.interaction.request(request) if self.interaction is not None else pending
-        waiting = self.control.execute(Command("campaign.transition", {
-            "id": campaign_id, "status": "WAITING_FOR_HUMAN",
-            "next_action": f"Answer the Planner questions for {campaign_id}.",
-        }))
-        if waiting.status != "SUCCESS":
-            return CampaignOutcome(waiting.status, waiting.message, campaign_id, waiting.data)
+        if self._state().get("campaigns", {}).get(campaign_id, {}).get("status") == "WAITING_FOR_HUMAN":
+            waiting = CampaignOutcome(
+                "NOT_READY", f"Campaign {campaign_id} is already waiting for Planner answers",
+                campaign_id,
+            )
+        else:
+            transitioned = self.control.execute(Command("campaign.transition", {
+                "id": campaign_id, "status": "WAITING_FOR_HUMAN",
+                "next_action": f"Answer the Planner questions for {campaign_id}.",
+            }))
+            if transitioned.status != "SUCCESS":
+                return CampaignOutcome(
+                    transitioned.status, transitioned.message, campaign_id, transitioned.data,
+                )
+            waiting = CampaignOutcome(
+                transitioned.status, transitioned.message, campaign_id, transitioned.data,
+            )
         if isinstance(response, HumanResponse):
             persistent.answer(campaign_id, request.request_id, response.answers)
             return self.answer(campaign_id, request.request_id, response.answers)
@@ -369,7 +381,7 @@ class CampaignController:
             partial = {
                 "risk": risk, "quality_mode": quality_mode, "change_classes": change_classes,
             }
-            review_scope = self.quality.decide(partial).value
+            review_scope = self.attempts.decide_quality(partial).value
             if review_scope == "DIAGNOSTIC":
                 review_scope = "NONE"
             prohibited_actions = list(raw.get("prohibited_actions", []))
@@ -534,6 +546,32 @@ class CampaignController:
                     campaign_id, transitioned.data,
                 )
             return CampaignOutcome("NOT_READY", "Campaign is not waiting for an answer", campaign_id)
+        native_plan_path = self.canonical / "campaigns" / campaign_id / "native-plan-context.json"
+        if native_plan_path.is_file():
+            try:
+                native_plan = json.loads(native_plan_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as error:
+                return CampaignOutcome(
+                    "INVALID", f"native planning context is invalid: {error}", campaign_id,
+                )
+            if native_plan.get("request_id") == request_id:
+                activated = self.control.execute(Command("campaign.transition", {
+                    "id": campaign_id, "status": "ACTIVE",
+                }))
+                if activated.status != "SUCCESS":
+                    return CampaignOutcome(
+                        activated.status, activated.message, campaign_id, activated.data,
+                    )
+                native_plan.update(
+                    status="ANSWERED",
+                    answers={key: list(values) for key, values in response.answers.items()},
+                    answered_at=_now(),
+                )
+                _write_json_atomic(native_plan_path, native_plan)
+                return CampaignOutcome(
+                    "SUCCESS", "Planner answers recorded; a fresh PLAN_PHASE is ready",
+                    campaign_id, {"request_id": request_id},
+                )
         already_activated = False
         admission_path = self.canonical / "campaigns" / campaign_id / "admission-context.json"
         if admission_path.is_file():
@@ -967,15 +1005,56 @@ class CampaignController:
         )
 
     def materialize(self, campaign_id: str) -> CampaignOutcome:
-        reconciled = self._reconcile_terminal(campaign_id, "ASK_HUMAN", "TARGET_REACHED")
-        if reconciled is not None:
-            return reconciled
         state = self._state()
         record = state.get("campaigns", {}).get(campaign_id)
         if record is None:
             return CampaignOutcome("INVALID", f"unknown Campaign: {campaign_id}", campaign_id)
         if record["status"] != "TARGET_REACHED":
             return CampaignOutcome("NOT_READY", "only a reached Campaign can be materialized", campaign_id)
+        if record["checkpoint"] == record["last_materialized_checkpoint"]:
+            return CampaignOutcome(
+                "SUCCESS", "Campaign checkpoint is already materialized", campaign_id,
+                {"campaign_id": campaign_id, "checkpoint": record["checkpoint"], "applied": False},
+            )
+        pending_id = state.get("current_action_id")
+        pending_type: str | None = None
+        materialization_context: dict[str, Any] | None = None
+        if pending_id is not None:
+            try:
+                pending = json.loads(
+                    (self.canonical / "actions" / str(pending_id) / "action.json").read_text(
+                        encoding="utf-8",
+                    )
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                return CampaignOutcome(
+                    "INFRA_FAILURE", f"cannot read pending Action: {error}", campaign_id,
+                )
+            pending_type = str(pending.get("type"))
+            if pending.get("campaign_id") != campaign_id:
+                return CampaignOutcome("NOT_READY", "another Campaign has a pending Action", campaign_id)
+            if pending_type == "TARGET_REACHED":
+                reconciled = self._reconcile_terminal(campaign_id, "TARGET_REACHED")
+                if reconciled is not None:
+                    return reconciled
+            elif pending_type == "ASK_HUMAN":
+                blocker_path = self.canonical / "campaigns" / campaign_id / "blocker-context.json"
+                try:
+                    materialization_context = json.loads(blocker_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    materialization_context = None
+                if not (
+                    materialization_context
+                    and materialization_context.get("kind") == "materialization-conflict"
+                    and materialization_context.get("status") == "PENDING"
+                    and materialization_context.get("request_id")
+                    == pending.get("context", {}).get("request_id")
+                ):
+                    return CampaignOutcome(
+                        "NOT_READY", "an unrelated ASK_HUMAN Action is still pending", campaign_id,
+                    )
+            else:
+                return CampaignOutcome("NOT_READY", "a non-terminal Action is still pending", campaign_id)
         try:
             materialized = CampaignWorkspace(self.root, campaign_id).materialize(
                 from_commit=record["last_materialized_checkpoint"],
@@ -986,11 +1065,33 @@ class CampaignController:
                 "next_action": f"Resolve source conflicts, then run campaign materialize {campaign_id}.",
             }))
             return CampaignOutcome("BLOCKED", f"materialization blocked: {error}", campaign_id)
+        if pending_type == "ASK_HUMAN":
+            reconciled = self._reconcile_terminal(campaign_id, "ASK_HUMAN")
+            if reconciled is not None:
+                return reconciled
         result = self.control.execute(Command("campaign.materialized", {
             "id": campaign_id, "checkpoint": materialized.to_commit,
         }))
+        if result.status == "SUCCESS" and materialization_context is not None:
+            request_id = str(materialization_context["request_id"])
+            request_path = (
+                self.canonical / "campaigns" / campaign_id / "human-requests" / f"{request_id}.json"
+            )
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            if request.get("status") == "PENDING":
+                request.update(
+                    status="AUTO_RESOLVED", answers={"resolution": ["Retry Campaign"]},
+                    answered_at=_now(),
+                )
+                _write_json_atomic(request_path, request)
+            materialization_context.update(status="RESOLVED", resolved_at=_now())
+            _write_json_atomic(
+                self.canonical / "campaigns" / campaign_id / "blocker-context.json",
+                materialization_context,
+            )
         return CampaignOutcome(result.status, result.message, campaign_id, {
             **dict(result.data), "patch_sha256": materialized.patch_sha256,
+            "applied": materialized.applied,
         })
 
     def archive(self, campaign_id: str) -> CampaignOutcome:
