@@ -10,12 +10,16 @@ import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from jsonschema import Draft202012Validator
+
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SOURCE_ROOT / "src"))
 
 from autodev._project import initialize_project
+from autodev.action import ActionController
 from autodev.campaign import CampaignController, CampaignRequest
+from autodev.control_plane import Command, ControlPlane
 
 
 TOOL_NAMES = {
@@ -115,6 +119,97 @@ class StructuredProposalCoreTests(unittest.TestCase):
         self.assertEqual(outcome.campaign_id, "CAMP-001")
         self.assertFalse(hasattr(controller, "_mcp_planner"))
 
+    def test_admission_ask_is_restartable_and_invalid_answers_are_zero_mutation(self) -> None:
+        campaign = CampaignController(self.root)
+        planned = campaign.propose_structured(
+            CampaignRequest("High risk change", mode="CHANGE", target="CHANGE_COMPLETE"),
+            proposal(risk="HIGH"),
+        )
+        blocked = campaign.approve("CAMP-001", planned.data["proposal_hash"])
+        self.assertEqual(blocked.status, "BLOCKED", blocked)
+
+        ask = ActionController(self.root).get_next_action("CAMP-001")
+        context = ask.action["context"]
+        self.assertEqual(context["request_id"], blocked.data["request_id"])
+        self.assertEqual(context["questions"][0]["id"], "decision")
+        self.assertEqual(
+            [item["label"] for item in context["questions"][0]["options"]],
+            ["Approve exception", "Revise batch"],
+        )
+        self.assertEqual(context["answer_contract"], {
+            "request_id": blocked.data["request_id"],
+            "question_ids": ["decision"],
+            "answers_must_cover_exactly": ["decision"],
+        })
+        recovered = ActionController(self.root).get_next_action("CAMP-001")
+        self.assertEqual(recovered.action, ask.action)
+
+        state_path = self.root / ".autodev/state.json"
+        request_path = (
+            self.root / ".autodev/campaigns/CAMP-001/human-requests"
+            / f"{blocked.data['request_id']}.json"
+        )
+        before_state = state_path.read_bytes()
+        before_request = request_path.read_bytes()
+        unknown = CampaignController(self.root).answer(
+            "CAMP-001", "HUMAN-unknown", {"decision": ["Approve exception"]},
+        )
+        mismatched = CampaignController(self.root).answer(
+            "CAMP-001", blocked.data["request_id"], {"wrong": ["Approve exception"]},
+        )
+        self.assertEqual(unknown.status, "INVALID")
+        self.assertEqual(mismatched.status, "INVALID")
+        self.assertEqual(state_path.read_bytes(), before_state)
+        self.assertEqual(request_path.read_bytes(), before_request)
+        self.assertEqual(
+            json.loads(state_path.read_text())["current_action_id"], ask.action["id"],
+        )
+
+    def test_generic_blocker_has_a_persisted_restartable_resolution(self) -> None:
+        campaign = CampaignController(self.root)
+        planned = campaign.propose_structured(
+            CampaignRequest("Change", mode="CHANGE", target="CHANGE_COMPLETE"), proposal(),
+        )
+        self.assertEqual(
+            campaign.approve("CAMP-001", planned.data["proposal_hash"]).status,
+            "SUCCESS",
+        )
+        blocked = ControlPlane(self.root).execute(Command("project.transition", {
+            "to": "BLOCKED", "blocker": "An external prerequisite is unresolved.",
+            "next_action": "Resolve it, then retry.",
+        }))
+        self.assertEqual(blocked.status, "SUCCESS")
+
+        ask = ActionController(self.root).get_next_action("CAMP-001")
+        self.assertEqual(ask.action["type"], "ASK_HUMAN")
+        context = ask.action["context"]
+        self.assertRegex(context["request_id"], r"^CAMP-001-blocker-[0-9]+$")
+        self.assertEqual(
+            [item["label"] for item in context["questions"][0]["options"]],
+            ["Retry Campaign", "Cancel Campaign"],
+        )
+        request_path = (
+            self.root / ".autodev/campaigns/CAMP-001/human-requests"
+            / f"{context['request_id']}.json"
+        )
+        self.assertTrue(request_path.is_file())
+        self.assertEqual(ActionController(self.root).get_next_action("CAMP-001").action, ask.action)
+
+        state_path = self.root / ".autodev/state.json"
+        before = state_path.read_bytes()
+        rejected = CampaignController(self.root).answer(
+            "CAMP-001", context["request_id"], {"resolution": ["invented option"]},
+        )
+        self.assertEqual(rejected.status, "INVALID")
+        self.assertEqual(state_path.read_bytes(), before)
+        resolved = CampaignController(self.root).answer(
+            "CAMP-001", context["request_id"], {"resolution": ["Retry Campaign"]},
+        )
+        self.assertEqual(resolved.status, "SUCCESS", resolved)
+        state = json.loads(state_path.read_text())
+        self.assertEqual(state["project_status"], "ACTIVE")
+        self.assertIsNone(state["current_action_id"])
+
 
 try:
     from mcp import ClientSession
@@ -168,16 +263,64 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(invalid.is_error, name)
         tools = {item.name: item for item in listed.tools}
         self.assertEqual(set(tools), TOOL_NAMES)
+        self.assertEqual(
+            len({json.dumps(item.output_schema, sort_keys=True) for item in tools.values()}),
+            12,
+        )
+
+        def assert_closed(schema: object, path: str = "output") -> None:
+            if isinstance(schema, dict):
+                if schema.get("type") == "object" or "properties" in schema:
+                    self.assertIs(schema.get("additionalProperties"), False, path)
+                for key, value in schema.items():
+                    assert_closed(value, f"{path}/{key}")
+            elif isinstance(schema, list):
+                for index, value in enumerate(schema):
+                    assert_closed(value, f"{path}/{index}")
+
         for item in tools.values():
             self.assertIn("project_root", item.input_schema["required"])
             self.assertFalse(item.input_schema["additionalProperties"])
             self.assertFalse(item.output_schema["additionalProperties"])
+            assert_closed(item.output_schema)
             self.assertIsNotNone(item.annotations)
             self.assertFalse(item.annotations.open_world_hint)
-        self.assertTrue(tools["inspect_project"].annotations.read_only_hint)
-        self.assertTrue(tools["campaign_status"].annotations.read_only_hint)
-        self.assertFalse(tools["get_next_action"].annotations.read_only_hint)
-        self.assertTrue(tools["materialize_campaign"].annotations.destructive_hint)
+        expected_annotations = {
+            "inspect_project": (True, False, True, False),
+            "initialize_project": (False, False, True, False),
+            "propose_campaign": (False, False, False, False),
+            "approve_campaign": (False, False, False, False),
+            "campaign_status": (True, False, True, False),
+            "campaign_continue": (False, False, False, False),
+            "pause_campaign": (False, False, False, False),
+            "answer_blocker": (False, True, True, False),
+            "retarget_campaign": (False, True, True, False),
+            "materialize_campaign": (False, True, False, False),
+            "get_next_action": (False, False, True, False),
+            "submit_action_result": (False, False, True, False),
+        }
+        for name, expected in expected_annotations.items():
+            annotation = tools[name].annotations
+            self.assertEqual((
+                annotation.read_only_hint,
+                annotation.destructive_hint,
+                annotation.idempotent_hint,
+                annotation.open_world_hint,
+            ), expected, name)
+
+        inspect_valid = await self.session_output("inspect_project", {
+            "project_root": str(self.root),
+        })
+        schema = tools["inspect_project"].output_schema
+        self.assertFalse(list(Draft202012Validator(schema).iter_errors(inspect_valid)))
+        adversarial = json.loads(json.dumps(inspect_valid))
+        adversarial["data"]["nested_extra"] = True
+        self.assertTrue(list(Draft202012Validator(schema).iter_errors(adversarial)))
+
+    async def session_output(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        async with self.session() as session:
+            result = await session.call_tool(name, arguments)
+            return result.structured_content
 
     async def test_initialize_inspect_propose_approve_and_security_errors(self) -> None:
         async with self.session() as session:
@@ -284,6 +427,16 @@ class MCPStdioTests(unittest.IsolatedAsyncioTestCase):
                 "project_root": str(self.root), "campaign_id": campaign_id,
             })
             self.assertEqual(target.structured_content["action"]["type"], "TARGET_REACHED")
+            listed = await session.list_tools()
+            target_schema = next(
+                item.output_schema for item in listed.tools if item.name == "get_next_action"
+            )
+            self.assertFalse(list(
+                Draft202012Validator(target_schema).iter_errors(target.structured_content)
+            ))
+            adversarial = json.loads(json.dumps(target.structured_content))
+            adversarial["action"]["context"]["nested_extra"] = True
+            self.assertTrue(list(Draft202012Validator(target_schema).iter_errors(adversarial)))
             materialized = await session.call_tool("materialize_campaign", {
                 "project_root": str(self.root), "campaign_id": campaign_id,
             })

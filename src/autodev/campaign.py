@@ -457,16 +457,37 @@ class CampaignController:
     ) -> CampaignOutcome:
         from autodev.human import PersistentHumanInteraction
 
-        reconciled = self._reconcile_terminal(campaign_id, "ASK_HUMAN")
-        if reconciled is not None:
-            return reconciled
-
+        persistent = PersistentHumanInteraction(self.root)
         try:
-            response = PersistentHumanInteraction(self.root).answer(
-                campaign_id, request_id, answers,
-            )
+            persistent.validate_answer(campaign_id, request_id, answers)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            return CampaignOutcome("INVALID", f"cannot validate answer: {error}", campaign_id)
+        state = self._state()
+        pending_id = state.get("current_action_id")
+        if pending_id is not None:
+            try:
+                pending_action = json.loads(
+                    (self.canonical / "actions" / str(pending_id) / "action.json").read_text(
+                        encoding="utf-8",
+                    )
+                )
+            except (OSError, json.JSONDecodeError) as error:
+                return CampaignOutcome("INVALID", f"pending Action cannot be read: {error}", campaign_id)
+            if (
+                pending_action.get("type") != "ASK_HUMAN"
+                or pending_action.get("campaign_id") != campaign_id
+                or pending_action.get("context", {}).get("request_id") != request_id
+            ):
+                return CampaignOutcome(
+                    "INVALID", "answer does not match the pending ASK_HUMAN Action", campaign_id,
+                )
+        try:
+            response = persistent.answer(campaign_id, request_id, answers)
         except (OSError, json.JSONDecodeError, ValueError) as error:
             return CampaignOutcome("INVALID", f"cannot record answer: {error}", campaign_id)
+        reconciled = self._reconcile_terminal(campaign_id, "ASK_HUMAN") if pending_id else None
+        if reconciled is not None:
+            return reconciled
         state = self._state()
         record = state.get("campaigns", {}).get(campaign_id)
         if record is None:
@@ -489,6 +510,29 @@ class CampaignController:
             finally:
                 self.planner = original_planner
         if record["status"] != "WAITING_FOR_HUMAN":
+            blocker_path = self.canonical / "campaigns" / campaign_id / "blocker-context.json"
+            if blocker_path.is_file():
+                blocker = json.loads(blocker_path.read_text(encoding="utf-8"))
+                if blocker.get("request_id") != request_id:
+                    return CampaignOutcome("INVALID", "answer does not match the blocker", campaign_id)
+                selected = response.answers["resolution"][0].lower()
+                if selected == "retry campaign":
+                    transitioned = self.control.execute(Command("project.transition", {"to": "ACTIVE"}))
+                elif selected == "cancel campaign":
+                    transitioned = self.control.execute(Command("campaign.transition", {
+                        "id": campaign_id, "status": "CANCELLED",
+                    }))
+                else:
+                    return CampaignOutcome("INVALID", "unknown blocker resolution", campaign_id)
+                if transitioned.status != "SUCCESS":
+                    return CampaignOutcome(
+                        transitioned.status, transitioned.message, campaign_id, transitioned.data,
+                    )
+                blocker_path.unlink()
+                return CampaignOutcome(
+                    "SUCCESS", f"Campaign blocker resolved: {response.answers['resolution'][0]}",
+                    campaign_id, transitioned.data,
+                )
             return CampaignOutcome("NOT_READY", "Campaign is not waiting for an answer", campaign_id)
         already_activated = False
         admission_path = self.canonical / "campaigns" / campaign_id / "admission-context.json"

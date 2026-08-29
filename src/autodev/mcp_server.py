@@ -59,17 +59,227 @@ _ACTION_ID = {"type": "string", "pattern": "^ACTION-[0-9a-f]{32}$"}
 _PROPOSAL_SCHEMA = json.loads(_read_text("schemas/campaign-proposal.schema.json"))
 _ACTION_SCHEMA = json.loads(_read_text("schemas/action.schema.json"))
 _ACTION_RESULT_SCHEMA = json.loads(_read_text("schemas/action-result.schema.json"))
-_OUTPUT_SCHEMA = _object(
+_CAMPAIGN_RECORD_SCHEMA = _object(
     {
-        "status": {"enum": _STATUSES},
-        "exit_code": {"type": "integer", "minimum": 0, "maximum": 5},
-        "message": {"type": "string"},
-        "campaign_id": {"anyOf": [_CAMPAIGN_ID, {"type": "null"}]},
-        "action": {"anyOf": [_ACTION_SCHEMA, {"type": "null"}]},
-        "data": {"type": "object"},
+        "status": {"enum": [
+            "PROPOSED", "ACTIVE", "WAITING_FOR_HUMAN", "TARGET_REACHED",
+            "ARCHIVED", "CANCELLED",
+        ]},
+        "phase": {"enum": [
+            "SCAFFOLD", "IMPLEMENT", "COMPONENT_VERIFY", "INTEGRATE", "HARDEN",
+            "TARGET_REACHED",
+        ]},
+        "mode": {"enum": ["CHANGE", "STAGED", "CRITICAL"]},
+        "target": {"enum": [
+            "CHANGE_COMPLETE", "ARCHITECTURE_BASELINE", "WORKING_MVP",
+            "INTEGRATED_SYSTEM", "RELEASE_CANDIDATE",
+        ]},
+        "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "checkpoint": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$"},
+        "last_materialized_checkpoint": {
+            "type": ["string", "null"], "pattern": "^[0-9a-f]{40,64}$",
+        },
+        "approved_at": {"type": ["string", "null"], "format": "date-time"},
     },
-    ["status", "exit_code", "message", "campaign_id", "action", "data"],
+    [
+        "status", "phase", "mode", "target", "proposal_hash", "checkpoint",
+        "last_materialized_checkpoint", "approved_at",
+    ],
 )
+_HUMAN_OPTION_SCHEMA = _object(
+    {"label": {"type": "string"}, "description": {"type": "string"}},
+    ["label", "description"],
+)
+_HUMAN_QUESTION_SCHEMA = _object(
+    {
+        "id": {"type": "string"},
+        "header": {"type": "string"},
+        "question": {"type": "string"},
+        "options": {"type": "array", "items": _HUMAN_OPTION_SCHEMA},
+        "isOther": {"type": "boolean"},
+        "isSecret": {"type": "boolean"},
+        "credential_only": {"type": "boolean"},
+    },
+    ["id", "header", "question", "options", "isOther"],
+)
+_ANSWER_CONTRACT_SCHEMA = _object(
+    {
+        "request_id": {"type": "string"},
+        "question_ids": {"type": "array", "items": {"type": "string"}},
+        "answers_must_cover_exactly": {"type": "array", "items": {"type": "string"}},
+    },
+    ["request_id", "question_ids", "answers_must_cover_exactly"],
+)
+_ACTION_CONTEXT_SCHEMA = _object(
+    {
+        "run_id": {"type": "string"},
+        "campaign_ref": {"type": "string"},
+        "requirements_ref": {"type": "string"},
+        "requirements_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "purpose": {"enum": ["PHASE_PLAN", "PHASE_REPAIR"]},
+        "source_fingerprint": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "contract_ref": {"type": "string"},
+        "contract_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "worker_action_id": _ACTION_ID,
+        "patch_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "attempt_ref": {"type": "string"},
+        "failure_ref": {"type": "string"},
+        "phase_context_ref": {"type": "string"},
+        "phase_flow_ref": {"type": "string"},
+        "scope": {"const": "PHASE"},
+        "campaign": _CAMPAIGN_RECORD_SCHEMA,
+        "blocker": {"type": ["string", "null"]},
+        "next_action": {"type": ["string", "null"]},
+        "request_id": {"type": "string"},
+        "questions": {"type": "array", "items": _HUMAN_QUESTION_SCHEMA},
+        "answer_contract": _ANSWER_CONTRACT_SCHEMA,
+    },
+    [],
+)
+_MCP_ACTION_SCHEMA = _object(
+    {**_ACTION_SCHEMA["properties"], "context": _ACTION_CONTEXT_SCHEMA},
+    _ACTION_SCHEMA["required"],
+)
+_VALIDATION_SCHEMA = _object(
+    {
+        "index": {"type": "integer"},
+        "argv": {"type": "array", "items": {"type": "string"}},
+        "cwd": {"type": "string"},
+        "returncode": {"type": "integer"},
+        "timed_out": {"type": "boolean"},
+        "stdout": {"type": "string"},
+        "stderr": {"type": "string"},
+        "duration_seconds": {"type": "number"},
+    },
+    [
+        "index", "argv", "cwd", "returncode", "timed_out", "stdout", "stderr",
+        "duration_seconds",
+    ],
+)
+_INSPECT_SUMMARY_SCHEMA = _object(
+    {
+        "project_name": {"type": ["string", "null"]},
+        "project_status": {"type": ["string", "null"]},
+        "revision": {"type": ["integer", "null"]},
+        "current_action_id": {"type": ["string", "null"]},
+        "pause_requested": {"type": ["boolean", "null"]},
+        "next_owner": {"type": ["string", "null"]},
+        "next_action": {"type": ["string", "null"]},
+    },
+    [
+        "project_name", "project_status", "revision", "current_action_id",
+        "pause_requested", "next_owner", "next_action",
+    ],
+)
+_INSPECT_VALIDATION_SCHEMA = _object(
+    {
+        "$schema": {"type": "string"},
+        "schema_version": {"const": 1},
+        "status": {"enum": _STATUSES},
+        "exit_code": {"type": "integer"},
+        "message": {"type": "string"},
+        "revision": {"type": ["integer", "null"]},
+        "data": _object({
+            "errors": {"type": "array", "items": {"type": "string"}},
+            "valid": {"type": "boolean"},
+            "ready": {"type": "boolean"},
+            "revision": {"type": "integer"},
+            "project_status": {"type": "string"},
+            "requirements": {
+                "type": "array",
+                "items": _object(
+                    {
+                        "id": {"type": "string"},
+                        "priority": {"enum": ["MUST", "SHOULD", "COULD"]},
+                        "status": {"type": "string"},
+                        "acceptance_signal": {"type": "string"},
+                    },
+                    ["id", "priority", "status", "acceptance_signal"],
+                ),
+            },
+        }, []),
+    },
+    ["$schema", "schema_version", "status", "exit_code", "message", "revision", "data"],
+)
+
+
+def _data_schema(*names: str) -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "error_code": {"type": "string"},
+        "errors": {"type": "array", "items": {"type": "string"}},
+    }
+    available = {
+        "initialized": {"type": "boolean"},
+        "project_root": {"type": "string"},
+        "validation": _INSPECT_VALIDATION_SCHEMA,
+        "summary": _INSPECT_SUMMARY_SCHEMA,
+        "campaign_ids": {"type": "array", "items": _CAMPAIGN_ID},
+        "copied": {"type": "array", "items": {"type": "string"}},
+        "conflicts": {"type": "array", "items": {"type": "string"}},
+        "proposal_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "questions": {"type": "array", "items": _HUMAN_QUESTION_SCHEMA},
+        "proposal": json.loads(_read_text("schemas/campaign.schema.json")),
+        "checkpoint": {"type": ["string", "null"]},
+        "campaign_id": _CAMPAIGN_ID,
+        "task_ids": {"type": "array", "items": {"type": "string"}},
+        "admission": {"enum": ["AUTO_ADMITTED", "HUMAN_APPROVED"]},
+        "human_approval_request_id": {"type": ["string", "null"]},
+        "human_approvable": {"type": "boolean"},
+        "request_id": {"type": "string"},
+        "artifact": {"type": "string"},
+        "graceful": {"type": "boolean"},
+        "cleared_action_id": {"type": ["string", "null"]},
+        "patch_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+        "action_id": _ACTION_ID,
+        "terminal_type": {"enum": ["ASK_HUMAN", "PAUSED", "TARGET_REACHED"]},
+        "incomplete_tasks": {"type": "array", "items": {"type": "string"}},
+        "validations": {"type": "array", "items": _VALIDATION_SCHEMA},
+        "findings": {"type": "array", "items": {"type": "string"}},
+    }
+    available.update(_CAMPAIGN_RECORD_SCHEMA["properties"])
+    properties.update({name: available[name] for name in names})
+    return _object(properties, [])
+
+
+def _output_schemas() -> dict[str, dict[str, Any]]:
+    data_fields = {
+        "inspect_project": ("initialized", "project_root", "validation", "summary", "campaign_ids"),
+        "initialize_project": ("copied", "conflicts"),
+        "propose_campaign": ("proposal_hash", "questions", "proposal"),
+        "approve_campaign": (
+            "checkpoint", "campaign_id", "task_ids", "admission",
+            "human_approval_request_id", "human_approvable", "request_id", "artifact",
+        ),
+        "campaign_status": tuple(_CAMPAIGN_RECORD_SCHEMA["properties"]),
+        "campaign_continue": ("campaign_id", "cleared_action_id"),
+        "pause_campaign": ("campaign_id", "graceful"),
+        "answer_blocker": (
+            "campaign_id", "task_ids", "admission", "human_approval_request_id",
+            "questions", "request_id", "artifact", "checkpoint", "patch_sha256", "from", "to",
+        ),
+        "retarget_campaign": ("campaign_id", "from", "to", "action_id", "terminal_type"),
+        "materialize_campaign": ("campaign_id", "checkpoint", "patch_sha256", "action_id", "terminal_type"),
+        "get_next_action": ("incomplete_tasks", "validations", "findings"),
+        "submit_action_result": ("validations", "findings", "incomplete_tasks"),
+    }
+    schemas: dict[str, dict[str, Any]] = {}
+    for name, fields in data_fields.items():
+        schema = _object(
+            {
+                "status": {"enum": _STATUSES},
+                "exit_code": {"type": "integer", "minimum": 0, "maximum": 5},
+                "message": {"type": "string"},
+                "campaign_id": {"anyOf": [_CAMPAIGN_ID, {"type": "null"}]},
+                "action": {"anyOf": [_MCP_ACTION_SCHEMA, {"type": "null"}]},
+                "data": _data_schema(*fields),
+            },
+            ["status", "exit_code", "message", "campaign_id", "action", "data"],
+        )
+        schema["$id"] = f"https://autodev.local/mcp/{name}-output.schema.json"
+        schemas[name] = schema
+    return schemas
 
 
 def _schemas() -> dict[str, dict[str, Any]]:
@@ -125,7 +335,7 @@ def _schemas() -> dict[str, dict[str, Any]]:
                     "type": "object",
                     "minProperties": 1,
                     "additionalProperties": {
-                        "type": "array", "minItems": 1,
+                        "type": "array", "minItems": 1, "maxItems": 1,
                         "items": {"type": "string", "minLength": 1},
                     },
                 },
@@ -319,6 +529,7 @@ def create_server() -> Any:
     from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool, ToolAnnotations
 
     schemas = _schemas()
+    output_schemas = _output_schemas()
     annotations = {
         "inspect_project": ToolAnnotations(
             readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False,
@@ -336,19 +547,19 @@ def create_server() -> Any:
             readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False,
         ),
         "campaign_continue": ToolAnnotations(
-            readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+            readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False,
         ),
         "pause_campaign": ToolAnnotations(
             readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False,
         ),
         "answer_blocker": ToolAnnotations(
-            readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
+            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
         ),
         "retarget_campaign": ToolAnnotations(
             readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
         ),
         "materialize_campaign": ToolAnnotations(
-            readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False,
+            readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False,
         ),
         "get_next_action": ToolAnnotations(
             readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False,
@@ -376,7 +587,7 @@ def create_server() -> Any:
             name=name,
             description=descriptions[name],
             inputSchema=schemas[name],
-            outputSchema=_OUTPUT_SCHEMA,
+            outputSchema=output_schemas[name],
             annotations=annotations[name],
         )
         for name in TOOL_NAMES
@@ -398,6 +609,15 @@ def create_server() -> Any:
                     data={"error_code": "INVALID_ARGUMENT", "errors": errors},
                 )
                 if errors else _dispatch(name, arguments)
+            )
+        output_errors = sorted(
+            f"{'/'.join(str(part) for part in error.absolute_path) or '<root>'}: {error.message}"
+            for error in Draft202012Validator(output_schemas[name]).iter_errors(result)
+        ) if name in output_schemas else []
+        if output_errors:
+            result = _response(
+                "INFRA_FAILURE", "Core result violated the MCP output contract",
+                data={"error_code": "OUTPUT_CONTRACT", "errors": output_errors},
             )
         encoded = json.dumps(result, sort_keys=True, ensure_ascii=False)
         return CallToolResult(

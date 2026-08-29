@@ -432,13 +432,74 @@ class ActionController:
         state = self._read_state()
         campaign = state["campaigns"][campaign_id]
         role = "human" if action_type == "ASK_HUMAN" else "core"
+        context: dict[str, Any] = {
+            "campaign": campaign,
+            "blocker": state.get("blocker"),
+            "next_action": state.get("next_action"),
+        }
+        if action_type == "ASK_HUMAN":
+            try:
+                request = self._pending_human_request(campaign_id, state)
+            except (OSError, json.JSONDecodeError, ValueError) as error:
+                return ActionOutcome("INFRA_FAILURE", f"human request cannot be recovered: {error}")
+            question_ids = [str(question["id"]) for question in request["questions"]]
+            context.update(
+                request_id=request["request_id"],
+                questions=request["questions"],
+                answer_contract={
+                    "request_id": request["request_id"],
+                    "question_ids": question_ids,
+                    "answers_must_cover_exactly": question_ids,
+                },
+            )
         action = self._action_record(
             action_id=f"ACTION-{uuid.uuid4().hex}", action_type=action_type,
             campaign_id=campaign_id, phase=campaign["phase"], task_id=None,
             role=role, quality_route="NONE", workspace=None,
-            context={"campaign": campaign, "blocker": state.get("blocker"), "next_action": state.get("next_action")},
+            context=context,
         )
         return self._persist_action(action)
+
+    def _pending_human_request(
+        self, campaign_id: str, state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        directory = self._canonical / "campaigns" / campaign_id / "human-requests"
+        pending: list[dict[str, Any]] = []
+        for path in sorted(directory.glob("*.json")) if directory.is_dir() else ():
+            document = json.loads(path.read_text(encoding="utf-8"))
+            if document.get("campaign_id") == campaign_id and document.get("status") == "PENDING":
+                pending.append(document)
+        if len(pending) > 1:
+            raise ValueError("multiple human requests are pending")
+        if pending:
+            return pending[0]
+        if state.get("project_status") != "BLOCKED":
+            raise ValueError("ASK_HUMAN requires a persisted pending request")
+
+        from autodev.human import (
+            HumanOption, HumanQuestion, HumanRequest, PersistentHumanInteraction,
+        )
+
+        request_id = f"{campaign_id}-blocker-{state['revision']}"
+        request = HumanRequest(
+            campaign_id,
+            (HumanQuestion(
+                "resolution", "Blocker",
+                f"The project is blocked: {state.get('blocker')} Choose a safe resolution.",
+                (
+                    HumanOption("Retry Campaign", "Confirm the blocker is resolved and retry through Core."),
+                    HumanOption("Cancel Campaign", "Cancel this Campaign without materializing more work."),
+                ),
+                allow_other=False,
+            ),),
+            request_id=request_id,
+        )
+        persisted = PersistentHumanInteraction(self._root).request(request)
+        _write_json_atomic(
+            self._canonical / "campaigns" / campaign_id / "blocker-context.json",
+            {"request_id": request_id, "kind": "project-blocker"},
+        )
+        return json.loads(persisted.artifact_path.read_text(encoding="utf-8"))
 
     def _create_phase_review(
         self, campaign_id: str, phase: str,

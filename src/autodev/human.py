@@ -135,20 +135,15 @@ class PersistentHumanInteraction:
         )
         return Pending(request.request_id, path, reason)
 
-    def answer(self, campaign_id: str, request_id: str, answers: Mapping[str, Sequence[str]]) -> HumanResponse:
+    def validate_answer(
+        self, campaign_id: str, request_id: str, answers: Mapping[str, Sequence[str]],
+    ) -> tuple[dict[str, Any], dict[str, list[str]]]:
+        """Validate one persisted answer without changing the request artifact."""
+
         path = self.root / ".autodev" / "campaigns" / campaign_id / "human-requests" / f"{request_id}.json"
         document = json.loads(path.read_text(encoding="utf-8"))
-        if document.get("status") in {"ANSWERED", "AUTO_RESOLVED"}:
-            existing = {
-                key: tuple(str(item) for item in value)
-                for key, value in document.get("answers", {}).items()
-            }
-            requested = {key: tuple(str(item) for item in value) for key, value in answers.items()}
-            if existing != requested:
-                raise ValueError("human request was already answered differently")
-            return HumanResponse(request_id, existing, "persistent")
-        if document.get("status") != "PENDING":
-            raise ValueError("human request is not pending")
+        if document.get("campaign_id") != campaign_id or document.get("request_id") != request_id:
+            raise ValueError("human request identity mismatch")
         known = {question["id"] for question in document["questions"]}
         if any(question.get("credential_only") for question in document["questions"]):
             raise ValueError("credential answers are never persisted")
@@ -158,8 +153,32 @@ class PersistentHumanInteraction:
             key: [str(item) for item in value if str(item).strip()]
             for key, value in answers.items()
         }
-        if any(not value for value in normalized.values()):
-            raise ValueError("answers must be non-empty")
+        if any(len(value) != 1 for value in normalized.values()):
+            raise ValueError("each answer must contain exactly one non-empty value")
+        for question in document["questions"]:
+            allowed = {str(option["label"]) for option in question.get("options", [])}
+            selected = normalized[str(question["id"])][0]
+            if allowed and not question.get("isOther", True) and selected not in allowed:
+                raise ValueError(f"answer is not an allowed option for {question['id']}")
+        if document.get("status") in {"ANSWERED", "AUTO_RESOLVED"}:
+            existing = {
+                key: [str(item) for item in value]
+                for key, value in document.get("answers", {}).items()
+            }
+            if existing != normalized:
+                raise ValueError("human request was already answered differently")
+            return document, normalized
+        if document.get("status") != "PENDING":
+            raise ValueError("human request is not pending")
+        return document, normalized
+
+    def answer(self, campaign_id: str, request_id: str, answers: Mapping[str, Sequence[str]]) -> HumanResponse:
+        path = self.root / ".autodev" / "campaigns" / campaign_id / "human-requests" / f"{request_id}.json"
+        document, normalized = self.validate_answer(campaign_id, request_id, answers)
+        if document.get("status") in {"ANSWERED", "AUTO_RESOLVED"}:
+            return HumanResponse(
+                request_id, {key: tuple(value) for key, value in normalized.items()}, "persistent",
+            )
         document["answers"] = normalized
         document["status"] = "ANSWERED"
         document["answered_at"] = _now()
