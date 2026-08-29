@@ -88,6 +88,8 @@ def _bootstrap_documents(name: str, created_at: str | None = None) -> dict[str, 
             "current_milestone": None,
             "current_task_id": None,
             "current_run_id": None,
+            "current_action_id": None,
+            "pause_requested": False,
             "last_outcome": None,
             "last_checkpoint": None,
             "blocker": None,
@@ -108,6 +110,7 @@ def _bootstrap_documents(name: str, created_at: str | None = None) -> dict[str, 
             "runs/*\n"
             "locks/*\n"
             "workspaces/*\n"
+            "actions/*\n"
             "campaigns/*/checkpoint-journal/*\n"
             "campaigns/*/phase-summary-*.json\n"
             "campaigns/*/materialization-journal.json\n"
@@ -126,7 +129,7 @@ def _bootstrap_documents(name: str, created_at: str | None = None) -> dict[str, 
 
 _CANONICAL_DIRS = tuple(
     f".autodev/{name}"
-    for name in ("tasks", "runs", "events", "locks", "workspaces", "migrations")
+    for name in ("tasks", "runs", "events", "locks", "workspaces", "migrations", "actions")
 )
 
 
@@ -713,3 +716,151 @@ def rollback_v2_migration(root: Path, migration_id: str) -> ProjectOperation:
     except OSError as error:
         return ProjectOperation("INFRA_FAILURE", f"V2 rollback failed: {error}", {})
     return ProjectOperation("SUCCESS", "V2 migration rolled back", {"migration_id": migration_id})
+
+
+def _v3_asset_hashes(canonical: Path) -> dict[str, str]:
+    preserved_roots = ("campaigns", "tasks", "runs")
+    return {
+        str(path.relative_to(canonical)): _sha256(path)
+        for name in preserved_roots
+        for path in sorted((canonical / name).rglob("*"))
+        if path.is_file()
+    }
+
+
+def _campaign_refs(root: Path) -> dict[str, str]:
+    process = subprocess.run(
+        ["git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/autodev/campaigns"],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    if process.returncode:
+        raise RuntimeError(process.stderr.strip() or "cannot inspect Campaign refs")
+    return dict(line.split(" ", 1) for line in process.stdout.splitlines() if " " in line)
+
+
+def check_v3_migration(root: Path) -> ProjectOperation:
+    """Read-only applicability and preservation report for V3-to-V4."""
+
+    root = root.resolve()
+    canonical = root / ".autodev"
+    try:
+        state = json.loads((canonical / "state.json").read_text(encoding="utf-8"))
+        manifest = json.loads((canonical / "manifest.json").read_text(encoding="utf-8"))
+        refs = _campaign_refs(root)
+        assets = _v3_asset_hashes(canonical)
+    except (OSError, json.JSONDecodeError, RuntimeError) as error:
+        return ProjectOperation("INVALID", f"cannot inspect V3 project: {error}", {})
+    version = str(state.get("framework_version", manifest.get("framework_version", "")))
+    already_v4 = "current_action_id" in state or "pause_requested" in state
+    if not version.startswith("3.") or already_v4:
+        return ProjectOperation("INVALID", "V3 migration is not applicable", {})
+    return ProjectOperation("SUCCESS", "V3 migration is applicable", {
+        "applicable": True,
+        "framework_version": version,
+        "asset_hashes": assets,
+        "campaign_refs": refs,
+    })
+
+
+def apply_v3_migration(root: Path) -> ProjectOperation:
+    """Stage, validate, and atomically install V4 Action state."""
+
+    root = root.resolve()
+    checked = check_v3_migration(root)
+    if checked.status != "SUCCESS":
+        return checked
+    migration_id = f"v3-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+    canonical = root / ".autodev"
+    backup = root / f".autodev.v3-frozen-{migration_id}"
+    staging = root / f".autodev.v4-staging-{migration_id}"
+    replaced = root / f".autodev.v3-replaced-{migration_id}"
+    try:
+        shutil.copytree(canonical, backup)
+        shutil.copytree(canonical, staging)
+        state = json.loads((staging / "state.json").read_text(encoding="utf-8"))
+        manifest = json.loads((staging / "manifest.json").read_text(encoding="utf-8"))
+        state.update(
+            framework_version=__version__, current_action_id=None, pause_requested=False,
+        )
+        manifest["framework_version"] = __version__
+        (staging / "actions").mkdir(exist_ok=True)
+        gitignore = staging / ".gitignore"
+        ignored = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+        if "actions/*\n" not in ignored:
+            ignored += "actions/*\n"
+        gitignore.write_text(ignored, encoding="utf-8")
+        (staging / "state.json").write_text(_dump(state), encoding="utf-8")
+        (staging / "manifest.json").write_text(_dump(manifest), encoding="utf-8")
+        if _v3_asset_hashes(staging) != checked.data["asset_hashes"]:
+            raise RuntimeError("staging changed a preserved V3 asset")
+        if _campaign_refs(root) != checked.data["campaign_refs"]:
+            raise RuntimeError("staging changed a Campaign private ref")
+        os.replace(canonical, replaced)
+        os.replace(staging, canonical)
+        metadata = {
+            "migration_id": migration_id,
+            "kind": "v3-to-v4",
+            "applied_at": _now(),
+            "backup_path": backup.name,
+            "asset_hashes": checked.data["asset_hashes"],
+            "campaign_refs": checked.data["campaign_refs"],
+            "v4_progress_started": False,
+        }
+        _write_json_atomic(canonical / "migrations" / f"{migration_id}.json", metadata)
+        validation = ControlPlane(root).execute(Command("validate"))
+        if validation.status != "SUCCESS":
+            raise RuntimeError("; ".join(validation.data.get("errors", [validation.message])))
+        shutil.rmtree(replaced)
+        return ProjectOperation("SUCCESS", "V3 project migrated to V4", {
+            "migration_id": migration_id,
+            "preserved_assets": len(checked.data["asset_hashes"]),
+            "preserved_refs": len(checked.data["campaign_refs"]),
+        })
+    except (OSError, RuntimeError, json.JSONDecodeError) as error:
+        if replaced.exists():
+            if canonical.exists():
+                failed = root / f".autodev.v4-failed-{uuid.uuid4().hex}"
+                os.replace(canonical, failed)
+                shutil.rmtree(failed, ignore_errors=True)
+            os.replace(replaced, canonical)
+        shutil.rmtree(staging, ignore_errors=True)
+        return ProjectOperation(
+            "INFRA_FAILURE", f"V3 migration failed: {error}", {"migration_id": migration_id},
+        )
+
+
+def rollback_v3_migration(root: Path, migration_id: str) -> ProjectOperation:
+    """Restore the frozen V3 canonical tree unless any V4 Action has existed."""
+
+    root = root.resolve()
+    canonical = root / ".autodev"
+    try:
+        metadata = json.loads(
+            (canonical / "migrations" / f"{migration_id}.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        return ProjectOperation("INVALID", f"cannot read V3 migration: {error}", {})
+    if metadata.get("kind") != "v3-to-v4":
+        return ProjectOperation("INVALID", "migration is not V3-to-V4", {})
+    action_created = metadata.get("v4_progress_started") or any(
+        path.is_file() for path in (canonical / "actions").glob("*/action.json")
+    )
+    if action_created:
+        return ProjectOperation(
+            "BLOCKED", "rollback permanently refused after the first V4 Action", {},
+        )
+    backup = root / str(metadata.get("backup_path", ""))
+    if not backup.is_dir():
+        return ProjectOperation("BLOCKED", "V3 frozen backup is unavailable", {})
+    if _campaign_refs(root) != metadata.get("campaign_refs"):
+        return ProjectOperation("BLOCKED", "Campaign private refs changed after migration", {})
+    tombstone = root / f".autodev.v4-rollback-{uuid.uuid4().hex}"
+    try:
+        os.replace(canonical, tombstone)
+        shutil.copytree(backup, canonical)
+        shutil.rmtree(tombstone)
+    except OSError as error:
+        if not canonical.exists() and tombstone.exists():
+            os.replace(tombstone, canonical)
+        return ProjectOperation("INFRA_FAILURE", f"V3 rollback failed: {error}", {})
+    return ProjectOperation("SUCCESS", "V3 migration rolled back", {"migration_id": migration_id})

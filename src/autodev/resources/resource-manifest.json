@@ -21,7 +21,9 @@
     "schemas/requirements.schema.json",
     "schemas/campaign.schema.json",
     "schemas/campaign-proposal.schema.json",
-    "schemas/human-request.schema.json"
+    "schemas/human-request.schema.json",
+    "schemas/action.schema.json",
+    "schemas/action-result.schema.json"
   ],
   "templates": [
     "templates/.codex/agents/autodev-builder.toml"

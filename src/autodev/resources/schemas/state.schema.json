@@ -32,6 +32,8 @@
     "current_milestone": {"$ref": "#/$defs/nullableString"},
     "current_task_id": {"type": ["string", "null"], "pattern": "^TASK-[0-9]{3,}$"},
     "current_run_id": {"$ref": "#/$defs/nullableString"},
+    "current_action_id": {"type": ["string", "null"], "pattern": "^ACTION-[0-9a-f]{32}$"},
+    "pause_requested": {"type": "boolean"},
     "last_outcome": {"type": ["string", "null"]},
     "last_checkpoint": {"$ref": "#/$defs/nullableString"},
     "blocker": {"$ref": "#/$defs/nullableString"},

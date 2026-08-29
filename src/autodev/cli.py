@@ -17,11 +17,14 @@ from autodev._project import (
     ProjectOperation,
     apply_migration,
     apply_v2_migration,
+    apply_v3_migration,
     check_migration,
     check_v2_migration,
+    check_v3_migration,
     initialize_project,
     rollback_migration,
     rollback_v2_migration,
+    rollback_v3_migration,
 )
 from autodev._workspace import _write_json_atomic, git_baseline_status, source_fingerprint
 from autodev.engines import CodexExecEngine
@@ -56,8 +59,8 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--name", required=True)
     init.add_argument("--merge", action="store_true")
 
-    migrate = commands.add_parser("migrate", help="migrate explicit V1 or V2 state")
-    migrate.add_argument("migration_version", nargs="?", choices=("v2",))
+    migrate = commands.add_parser("migrate", help="migrate explicit V1, V2, or V3 state")
+    migrate.add_argument("migration_version", nargs="?", choices=("v2", "v3"))
     migration_mode = migrate.add_mutually_exclusive_group(required=True)
     migration_mode.add_argument("--check", action="store_true")
     migration_mode.add_argument("--apply", action="store_true")
@@ -356,7 +359,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments.command == "init":
         operation = initialize_project(Path(arguments.target), arguments.name, merge=arguments.merge)
     elif arguments.command == "migrate":
-        if arguments.migration_version == "v2":
+        if arguments.migration_version == "v3":
+            if arguments.check:
+                operation = check_v3_migration(Path.cwd())
+            elif arguments.apply:
+                operation = apply_v3_migration(Path.cwd())
+            else:
+                operation = rollback_v3_migration(Path.cwd(), arguments.rollback)
+        elif arguments.migration_version == "v2":
             if arguments.check:
                 operation = check_v2_migration(Path.cwd())
             elif arguments.apply:

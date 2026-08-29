@@ -211,6 +211,14 @@ class ControlPlane:
                 return self._campaign_retarget(command)
             if command.name == "task.admit_batch":
                 return self._task_admit_batch(command)
+            if command.name == "action.create":
+                return self._action_create(command)
+            if command.name == "action.resolve":
+                return self._action_resolve(command)
+            if command.name == "action.pause":
+                return self._action_pause(command)
+            if command.name == "action.continue":
+                return self._action_continue(command)
             raise _CommandFailure("INVALID", f"unknown command: {command.name}")
         except _CommandFailure as error:
             revision = self._best_effort_revision()
@@ -1056,6 +1064,113 @@ class ControlPlane:
             _atomic_replace_json(self.canonical / "campaigns" / str(campaign_id) / "campaign.json", holder["contract"])
 
         return self._mutate(command, transform, prepare=prepare)
+
+    def _action_create(self, command: Command) -> CommandResult:
+        action = command.arguments.get("action")
+        if not isinstance(action, dict):
+            raise _CommandFailure("INVALID", "action.create requires an Action object")
+        errors = self._validate_document("action", action, "action.json")
+        if errors:
+            raise _CommandFailure("INVALID", "invalid Action", data={"errors": errors})
+        action_id = action["id"]
+        campaign_id = action["campaign_id"]
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            record = state.get("campaigns", {}).get(campaign_id)
+            if record is None:
+                raise _CommandFailure("INVALID", f"unknown Campaign: {campaign_id}")
+            if state.get("current_action_id") is not None:
+                raise _CommandFailure("NOT_READY", "another Action is pending")
+            if action["canonical_revision"] != state["revision"] + 1:
+                raise _CommandFailure("INVALID", "Action canonical revision is not the next revision")
+            state["current_action_id"] = action_id
+            state["next_owner"] = "HUMAN" if action["role"] == "human" else "COMMANDER"
+            state["next_action"] = f"Complete {action['type']} for {campaign_id}."
+            return state, {"action_id": action_id, "campaign_id": campaign_id, "type": action["type"]}
+
+        def prepare() -> None:
+            path = self.canonical / "actions" / action_id / "action.json"
+            if path.exists():
+                existing = self._read_json(path)
+                if existing != action:
+                    raise _CommandFailure("INVALID", "Action ID already has different content")
+                return
+            _atomic_replace_json(path, action)
+            for migration_path in sorted((self.canonical / "migrations").glob("v3-*.json")):
+                metadata = self._read_json(migration_path)
+                if metadata.get("kind") == "v3-to-v4" and not metadata.get("v4_progress_started"):
+                    metadata["v4_progress_started"] = True
+                    metadata["first_v4_action_id"] = action_id
+                    _atomic_replace_json(migration_path, metadata)
+
+        return self._mutate(command, transform, prepare=prepare)
+
+    def _action_resolve(self, command: Command) -> CommandResult:
+        action_id = command.arguments.get("action_id")
+        result = command.arguments.get("result")
+        outcome = command.arguments.get("outcome")
+        if not isinstance(action_id, str) or not isinstance(result, dict) or not isinstance(outcome, dict):
+            raise _CommandFailure("INVALID", "action.resolve requires action_id, result, and outcome")
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            if state.get("current_action_id") != action_id:
+                raise _CommandFailure("INVALID", "Action is not pending")
+            state["current_action_id"] = None
+            if state.get("pause_requested"):
+                state.update(
+                    pause_requested=False, project_status="PAUSED", next_owner="COMMANDER",
+                    next_action="Continue the Campaign when ready.",
+                )
+            return state, {"action_id": action_id, "result_hash": command.arguments.get("result_hash")}
+
+        def prepare() -> None:
+            directory = self.canonical / "actions" / action_id
+            _atomic_replace_json(directory / "result.json", result)
+            _atomic_replace_json(directory / "outcome.json", outcome)
+
+        return self._mutate(command, transform, prepare=prepare)
+
+    def _action_pause(self, command: Command) -> CommandResult:
+        campaign_id = command.arguments.get("campaign_id")
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            record = state.get("campaigns", {}).get(campaign_id)
+            if record is None or record.get("status") != "ACTIVE":
+                raise _CommandFailure("NOT_READY", "Campaign is not active")
+            if state.get("current_action_id") is None:
+                state.update(project_status="PAUSED", pause_requested=False)
+            else:
+                state["pause_requested"] = True
+            state["next_owner"] = "COMMANDER"
+            state["next_action"] = "Finish the pending Action, then pause."
+            return state, {"campaign_id": campaign_id, "graceful": state["pause_requested"]}
+
+        return self._mutate(command, transform)
+
+    def _action_continue(self, command: Command) -> CommandResult:
+        campaign_id = command.arguments.get("campaign_id")
+
+        def transform(state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+            record = state.get("campaigns", {}).get(campaign_id)
+            if record is None or record.get("status") != "ACTIVE":
+                raise _CommandFailure("NOT_READY", "Campaign is not active")
+            pending_id = state.get("current_action_id")
+            if pending_id is not None:
+                try:
+                    action = self._read_json(
+                        self.canonical / "actions" / str(pending_id) / "action.json"
+                    )
+                except (OSError, json.JSONDecodeError) as error:
+                    raise _CommandFailure("INVALID", f"pending Action cannot be read: {error}") from error
+                if action.get("type") != "PAUSED" or action.get("campaign_id") != campaign_id:
+                    raise _CommandFailure("NOT_READY", "a non-pause Action is still pending")
+            state.update(
+                current_action_id=None, pause_requested=False, project_status="ACTIVE",
+                next_owner="COMMANDER", next_action=f"Continue Campaign {campaign_id}.",
+            )
+            return state, {"campaign_id": campaign_id, "cleared_action_id": pending_id}
+
+        return self._mutate(command, transform)
 
     def _task_admit_batch(self, command: Command) -> CommandResult:
         campaign_id = command.arguments.get("campaign_id")

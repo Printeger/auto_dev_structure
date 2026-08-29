@@ -8,6 +8,7 @@ from autodev.control_plane import Command, CommandResult, ControlPlane
 from autodev.run_controller import RunController, RunOutcome, RunRequest
 from autodev.campaign import CampaignController, CampaignOutcome, CampaignRequest
 from autodev.campaign_workspace import CampaignWorkspace
+from autodev.action import ActionController, ActionOutcome
 from autodev.engines.app_server import AppServerCodexEngine
 from autodev.human import HumanInteraction
 from autodev.quality import QualityDecision
@@ -15,5 +16,6 @@ from autodev.quality import QualityDecision
 __all__ = [
     "Command", "CommandResult", "ControlPlane", "RunController", "RunOutcome", "RunRequest",
     "CampaignController", "CampaignOutcome", "CampaignRequest", "CampaignWorkspace",
+    "ActionController", "ActionOutcome",
     "HumanInteraction", "AppServerCodexEngine", "QualityDecision", "__version__",
 ]

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/action-result.schema.json",
+  "title": "AutoDev untrusted action result",
+  "type": "object",
+  "required": ["action_id", "canonical_revision", "outcome", "summary", "data", "findings", "blocker", "next_action"],
+  "properties": {
+    "action_id": {"type": "string", "pattern": "^ACTION-[0-9a-f]{32}$"},
+    "canonical_revision": {"type": "integer", "minimum": 0},
+    "outcome": {"enum": ["PASS", "PASS_WITH_DEBT", "REWORK", "BLOCKED"]},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 20000},
+    "data": {
+      "type": "object",
+      "properties": {
+        "phase": {"enum": ["SCAFFOLD", "IMPLEMENT", "COMPONENT_VERIFY", "INTEGRATE", "HARDEN"]},
+        "tasks": {"type": "array", "items": {"type": "object"}},
+        "questions": {"type": "array", "items": {"type": "object"}},
+        "debt_items": {"type": "array", "items": {"type": "object"}},
+        "review": {"type": "object"},
+        "diagnosis": {"type": "object"},
+        "answers": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "findings": {"type": "array", "maxItems": 20, "items": {"type": "string", "maxLength": 4000}},
+    "blocker": {"type": ["string", "null"], "maxLength": 10000},
+    "next_action": {"type": ["string", "null"], "maxLength": 10000}
+  },
+  "allOf": [
+    {"if": {"properties": {"outcome": {"const": "BLOCKED"}}}, "then": {"properties": {"blocker": {"type": "string", "minLength": 1}, "next_action": {"type": "string", "minLength": 1}}}}
+  ],
+  "additionalProperties": false
+}

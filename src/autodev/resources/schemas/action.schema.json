@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://autodev.local/schemas/action.schema.json",
+  "title": "AutoDev external action",
+  "type": "object",
+  "required": ["$schema", "schema_version", "id", "type", "canonical_revision", "campaign_id", "phase", "task_id", "role", "quality_route", "workspace", "workspace_fingerprint", "context", "result_schema", "created_at"],
+  "properties": {
+    "$schema": {"const": "https://autodev.local/schemas/action.schema.json"},
+    "schema_version": {"const": 1},
+    "id": {"type": "string", "pattern": "^ACTION-[0-9a-f]{32}$"},
+    "type": {"enum": ["PLAN_PHASE", "EXECUTE_TASK", "RUN_IMMEDIATE_REVIEW", "RUN_DIAGNOSTIC", "RUN_PHASE_REVIEW", "ASK_HUMAN", "PAUSED", "TARGET_REACHED"]},
+    "canonical_revision": {"type": "integer", "minimum": 0},
+    "campaign_id": {"type": "string", "pattern": "^CAMP-[0-9]{3,}$"},
+    "phase": {"type": ["string", "null"], "enum": ["SCAFFOLD", "IMPLEMENT", "COMPONENT_VERIFY", "INTEGRATE", "HARDEN", "TARGET_REACHED", null]},
+    "task_id": {"type": ["string", "null"], "pattern": "^TASK-[0-9]{3,}$"},
+    "role": {"enum": ["planner", "worker", "reviewer", "diagnostic", "human", "core"]},
+    "quality_route": {"enum": ["NONE", "IMMEDIATE", "PHASE", "DIAGNOSTIC"]},
+    "workspace": {"type": ["string", "null"]},
+    "workspace_fingerprint": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+    "context": {"type": "object", "maxProperties": 16},
+    "result_schema": {"const": "https://autodev.local/schemas/action-result.schema.json"},
+    "created_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}
