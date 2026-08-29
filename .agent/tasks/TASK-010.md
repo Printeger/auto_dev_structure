@@ -4,7 +4,7 @@
 - Quality mode: `INTEGRATION`
 - Requirements: `REQ-017`, `REQ-020`, `REQ-021`, `REQ-023`, `REQ-026`, `REQ-028`, `REQ-047`
 - Milestone: `M9-V4-HEADLESS-ADAPTER`
-- Status: `DRAFT`
+- Status: `ACCEPTED`
 
 ## Objective
 
@@ -37,6 +37,7 @@ Make Campaign/RunController and Fake/Codex/App Server paths reuse the V4 shared 
 ## Evidence
 
 - Adapter parity matrix, removed duplication diff, existing regression suite, and stable CLI outcome evidence.
+- Accepted in the MCP-enabled `171/171` V4 regression on 2026-08-30; shared lifecycle and parity fixes are local commits `4ed19ff` and `e92ff85`.
 
 ## Output Contract
 

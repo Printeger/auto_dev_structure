@@ -2,37 +2,56 @@
 
 ## Completed foundations
 
-- V2 established the installable package, canonical ControlPlane, V1 migration, isolated Runner/Engine seam, validation/review/evidence gates, reliability budgets, and live Codex hardening.
-- V3 established Campaign requirements, phase planning/admission, private CAS checkpoints, development strategies, human interaction, cumulative review, materialization, and V2 migration.
+- V2 established the installable package, canonical ControlPlane, V1 migration, isolated
+  Runner/Engine seam, validation/review/evidence gates, reliability budgets, and live Codex
+  hardening.
+- V3 established Campaign requirements, phase planning/admission, private CAS checkpoints,
+  development strategies, human interaction, cumulative review, materialization, and V2 migration.
 
-## M7-V4-CONTRACT — V4 contract and package identity
+## Completed V4 implementation
 
-- Freeze the single Codex-native topology and Action Protocol in project contracts and ADR-0007.
-- Set Python package version `4.0.0a1`, plugin version contract `4.0.0-alpha.1`, MCP dependency, and `autodev-mcp` entry point.
-- Add independently reviewable V4 Task contracts.
+### M7-V4-CONTRACT — V4 contract and package identity
 
-## M8-V4-ACTION-CORE — Action Protocol and V3 migration
+- Frozen single Codex-native topology and Action Protocol in project contracts and ADR-0007.
+- Python package `4.0.0a1`, plugin `4.0.0-alpha.1`, MCP dependency, and `autodev-mcp` entry point.
+- Independently reviewable V4 Task contracts. TASK-008 is `ACCEPTED`.
 
-- Implement strict persistent Action/Result schemas and `ActionController` with recovery-safe idempotency and revision conflict rejection.
-- Extract a shared Attempt lifecycle for workspace preparation, validation, Review/Diagnostic routing, evidence, budgets, checkpoint, progression, graceful pause, and safe materialization.
-- Add guarded `migrate v3 --check|--apply|--rollback`; forbid rollback after the first V4 Action.
+### M8-V4-ACTION-CORE — Action Protocol and V3 migration
 
-## M9-V4-HEADLESS-ADAPTER — Unified compatibility path
+- Persistent strict Action/Result protocol, isolated workspaces, Core-derived validation,
+  QualityRouter routing, evidence/budgets/checkpoints, recovery, pause, progression, and safe
+  materialization.
+- Guarded `migrate v3 --check|--apply|--rollback` with first-V4-Action rollback prohibition.
+- TASK-009 is `ACCEPTED` by focused fault-injection/migration tests and the MCP-enabled full suite.
 
-- Move Campaign/RunController and Fake/Codex/App Server Engines onto the shared Attempt lifecycle.
-- Preserve existing headless commands, Fake behavior, live gates, and CLI exit codes without exposing an execution-mode selector.
+### M9-V4-HEADLESS-ADAPTER — Unified compatibility path
 
-## M10-V4-CODEX-PLUGIN — MCP, plugin, and Skill
+- Campaign/RunController and Action flows reuse the Attempt lifecycle.
+- Fake/Codex/App Server contracts, live gates, CLI exit codes, evidence, and crash recovery remain
+  compatible. TASK-010 is `ACCEPTED` by adapter parity and full regression tests.
 
-- Implement the twelve-tool local stdio MCP boundary with strict schemas, accurate annotations, safe project-root resolution, and no Codex subprocesses.
-- Ship the explicit `$autodev` Skill and local plugin, with one Proposal confirmation, Action loop, compact Commander context, fresh subagents, and no hooks/UI.
+### M10-V4-CODEX-PLUGIN — MCP, plugin, and Skill
 
-## M11-V4-RELEASE-GATE — Documentation, acceptance, and review
+- Twelve strict local stdio tools, explicit `project_root`, annotations, error mapping, safe root
+  resolution, and Core-only canonical mutations.
+- Explicit `$autodev` Skill, repository `personal` marketplace, one Proposal confirmation, fresh
+  specialists, single-Worker rule, and no hooks/UI. TASK-011 is `ACCEPTED` by MCP, validator,
+  package-install, and plugin-layout smokes.
 
-- Make `$autodev` the README entry point and document recovery, blockers, pause/resume, retarget, materialization, and headless positioning.
-- Pass existing and new Fake/MCP/plugin/migration/package tests, validation, wheel/install smoke, and fixed-point Standards plus Spec reviews from `v3.0.0a1`.
-- Fix blocking review findings and record final handoff/state/evidence. Do not push, publish, deploy, or run an unauthorized live model Campaign.
+## In review
+
+### M11-V4-RELEASE-GATE — Documentation, acceptance, and review
+
+- Completed: README V4 normal/recovery/migration/headless guidance; handoff/state refresh;
+  MCP-enabled `171/171` regression; wheel build and isolated install/stdio smoke; Plugin/Skill/
+  marketplace validation.
+- Pending: separate Standards and `v4.md` Spec reviews fixed at `v3.0.0a1`; blocking-finding fixes;
+  focused rereview; final post-fix full verification and acceptance record.
+- TASK-012 remains `REVIEW` until both review axes are non-blocking. No push, publish, deploy, or
+  unauthorized live model Campaign is permitted.
 
 ## Deferred
 
-Dashboard/UI, hooks, automatic Goal Mode, parallel writers, multi-repository execution, native Windows process/lock semantics, and any user-facing backend choice remain out of scope.
+Dashboard/UI, hooks, automatic Goal Mode, parallel writers, multi-repository execution, Windows
+process/lock semantics, and any user-facing runtime implementation choice remain out of
+scope.

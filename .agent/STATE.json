@@ -1,18 +1,18 @@
 {
   "$schema": "./STATE.schema.json",
   "schema_version": 1,
-  "project_name": "{{PROJECT_NAME}}",
-  "project_status": "COMPLETE",
+  "project_name": "AutoDev",
+  "project_status": "ACTIVE",
   "quality_mode": "HARDENING",
-  "phase": "CHECKPOINT",
+  "phase": "REVIEW",
   "last_outcome": "PASS",
-  "current_milestone": "M6-V2-LIVE-SMOKE",
-  "current_task_id": null,
-  "last_good_commit": "385fbdd",
-  "agent_calls": 0,
+  "current_milestone": "M11-V4-RELEASE-GATE",
+  "current_task_id": "TASK-012",
+  "last_good_commit": "43ea3fb",
+  "agent_calls": 1,
   "rework_count": 0,
   "blocker": null,
-  "next_action": null,
-  "next_owner": "NONE",
-  "updated_at": "2026-08-29T15:30:45+08:00"
+  "next_action": "Run independent Standards and v4.md Spec reviews from v3.0.0a1, fix blocking findings, and rerun final verification.",
+  "next_owner": "REVIEWER",
+  "updated_at": "2026-08-30T03:21:23+08:00"
 }

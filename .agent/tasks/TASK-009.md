@@ -4,7 +4,7 @@
 - Quality mode: `INTEGRATION`
 - Requirements: `REQ-044`, `REQ-045`, `REQ-046`, `REQ-048`, `REQ-049`, `REQ-050`, `REQ-055`, `REQ-056`
 - Milestone: `M8-V4-ACTION-CORE`
-- Status: `READY`
+- Status: `ACCEPTED`
 
 ## Objective
 
@@ -41,6 +41,7 @@ Implement persistent, recovery-safe Action orchestration at the confirmed `Actio
 ## Evidence
 
 - Fault-injection and snapshot tests, full Fake Campaign trace, workspace/review concurrency evidence, migration preservation hashes, and full regression output.
+- Accepted in the MCP-enabled `171/171` V4 regression on 2026-08-30; implementation and recovery fixes are local commits `27e6826` through `ef60002`.
 
 ## Output Contract
 

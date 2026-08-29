@@ -2,39 +2,74 @@
 
 ## Current objective
 
-AutoDev 2.0 alpha core, runtime hardening, and the authorized release smoke are complete. Linux live runs preflight before lock, Task claim, or model invocation. BUILD uses `:workspace`; backend selection belongs to Codex.
+AutoDev 4.0 alpha implementation, headless parity, local stdio MCP, and repository plugin are
+implemented. The release documentation and local acceptance slice is complete. TASK-012 remains in
+`REVIEW`: the required independent fixed-point Standards and `v4.md` Spec reviews from
+`v3.0.0a1` have not yet been run and must not be inferred from the test evidence below.
 
-The next decision is release policy: keep `2.0.0a1`, define stable compatibility promises, or authorize packaging/publication. No release or remote mutation has been performed.
+The next owner is a fresh Reviewer. Run the two review axes independently, fix any blocking
+findings, rerun focused review and final verification, then decide whether TASK-012 can move from
+`REVIEW` to `ACCEPTED`.
 
-## Accepted behavior
+## Accepted V4 behavior
 
-- Installable Python 3.11+ package, console entry point, version `2.0.0a1`, sole runtime dependency `jsonschema>=4.26,<5`.
-- `.autodev/` canonical state, Draft 2020-12 validation, optimistic revisions, atomic state/events, frozen Task contracts and derived completion.
-- V2 init plus read-only/checksum-aware V1 migration, staged apply and guarded rollback.
-- Atomic lock/heartbeat/stale recovery, isolated Git worktree, binary patch checkpoint, source fingerprint concurrency protection.
-- Codex/FakeCodexRunner seam, corrected Codex 0.144.5 option scoping, strict structured output, approval never, MCP/hooks disabled, config/login probing, no-model sandbox preflight, timeout/STOP escalation, and structured runtime diagnostics. Sandbox startup and compatibility failures remain fail-closed.
-- Three-layer `AUTODEV_LIVE_CODEX=1` authorization; Git HEAD and clean-source admission before claim; single-Task and explicit continuous Runner, deterministic selection, structured validations, risk-based review routing, evidence/debt gates, budgets and semantic stagnation.
-- BUILD + LOW/MEDIUM uses one fresh restricted Builder with no Reviewer; AutoDev's state/path/test/evidence checks are the Commander gate.
+- Installable Python 3.11+ package `4.0.0a1` with `autodev` and `autodev-mcp` entry points,
+  `jsonschema>=4.26,<5`, and `mcp>=2.1,<3`.
+- Codex plugin `4.0.0-alpha.1`: explicit `$autodev` Skill plus local stdio MCP only; no hooks or UI.
+- One normal interactive path: `$autodev -> local stdio MCP -> AutoDev Core -> current Codex
+  Commander -> fresh subagents`.
+- One Proposal and Authority Envelope confirmation after the current Commander grills material
+  decisions. The MCP path does not launch another Planner, Codex subprocess, or App Server.
+- Persistent `ActionController` seam with only `get_next_action(campaign_id)` and
+  `submit_action_result(action_id, result)` as workflow methods. Pending reads, result retries,
+  revision checks, isolated workspace enforcement, Core-derived changes/validation, QualityRouter,
+  evidence, checkpoint, progression, graceful pause, terminal recovery, and safe materialization are
+  covered by Fake/fault-injection tests.
+- Shared Attempt lifecycle parity for Action and retained headless adapters.
+- Guarded V3-to-V4 check/apply/rollback preserving Campaign refs, Tasks, Evidence, checkpoints, and
+  dirty user source. Creating the first V4 Action permanently forbids rollback.
+- `CHANGE`, `STAGED`, and `CRITICAL` are development strategies. The persisted compatibility field
+  `mode` stores that strategy only.
 
-## Evidence
+## Local acceptance evidence
 
-- `pytest -q` and `python3 -m unittest discover -s tests -q` — 85/85 PASS; ordinary tests use `FakeCodexRunner` or fake local executables and make no model call.
-- `python3 scripts/autodev.py validate --ready`, `PYTHONPATH=src python3 -m autodev version`, and `git diff --check` — PASS.
-- Wheel `autodev-2.0.0a1-py3-none-any.whl` built with SHA-256 `e42516f3c0cfc0958fa944b753143f663ffcf097ff16160095360bf80c724ac4`; isolated-venv install with declared dependencies, `autodev version`, fresh `init`, and `validate --json` — PASS.
-- `python3 scripts/autodev.py validate --ready` — PASS for the retained V1 migration fixture.
-- `PYTHONPATH=src python3 -m autodev version` — `2.0.0a1`.
-- Offline wheel build and isolated-venv install smoke PASS; wheel included schemas, templates, checksum manifest and console entry point.
-- Accepted real Codex smoke: one Builder, zero Reviewers, only `greeting.py` changed, validation return code 0, Task ACCEPTED, Project COMPLETE, and no completion-time attempt.
-- Sanitized evidence is in `examples/build-low-greeting/smoke-result.json`; no model transcript or credentials are stored. PyPI publish: NOT RUN.
+- Fixed point: annotated tag `v3.0.0a1^{}` resolves to
+  `ad0e586aab8d38477eec7b3f7c5f3f23795ea2ca`.
+- MCP-enabled isolated environment:
+  `python3 -m unittest discover -s tests -v` — `171/171 PASS` in 29.448 seconds. The suite includes
+  official Python MCP stdio initialization/tool/call tests; it uses Fake/local processes and made no
+  live model call.
+- Focused package tests — `8/8 PASS`; focused V4 migration tests — `4/4 PASS`.
+- Wheel `dist/autodev-4.0.0a1-py3-none-any.whl` built successfully with SHA-256
+  `9fd615468488800fa3674cdefdceada0c3d844797edeba9a788301c21bcc3fa6`.
+- A second isolated venv installed that wheel. `autodev version` and `autodev-mcp --version` both
+  returned `4.0.0a1`; installed plugin layout plus 12-tool stdio valid/invalid call smoke passed.
+- Plugin validator — PASS; Skill validator — PASS; repository `personal` marketplace structure and
+  local source resolution — PASS.
+- `python3 scripts/autodev.py validate` and `git diff --check` — PASS for the completed
+  documentation/state slice. Run them again after any review-driven fix.
+- Push, publication, deployment, remote mutation, real model Campaign, and fixed-point review:
+  NOT RUN.
+
+## Recovery and release notes
+
+- The README now documents `$autodev` as the sole normal workflow, explicit invocation, one
+  confirmation, Action-loop recovery, BLOCKED answers, graceful pause/resume in a new Commander,
+  retarget, conflict-safe target materialization/retry, V3 migration, and headless positioning.
+- Target materialization is attempted safely once. A source fingerprint or patch conflict becomes a
+  human blocker; explicit materialization is only a post-resolution retry.
+- Legacy commands and Codex exec/App Server/Fake engines remain headless, CI, test, debug, and
+  recovery infrastructure. They are not a second user workflow.
+- Wheel build emits setuptools deprecation warnings for the legacy license table/classifier. It does
+  not fail this alpha gate, but should be cleaned up before setuptools' 2027 enforcement date.
 
 ## Preserved user state
 
-- `.codex/config.toml` remains the user's pre-existing modification.
-- `Second version.md` remains untracked and untouched.
-- No commit, push, deploy or remote mutation was performed.
+- Work began from a clean worktree at local implementation commit `43ea3fb`; no unrelated user
+  files were modified.
+- No tag or commit was pushed. No package/plugin was published or deployed.
 
 ## Next action
 
-Keep the alpha version unless a separate release decision defines compatibility, packaging, publication, and rollback expectations. Future live runs still require doctor readiness and explicit authorization.
-
-For a trusted Docker/devcontainer outer boundary, configure `external-sandbox` plus `AUTODEV_EXTERNAL_SANDBOX=1`; never use it as an automatic fallback.
+Use `v3.0.0a1` as the fixed point and run separate Standards and `v4.md` Spec reviews. Do not mark
+TASK-012 accepted while either axis has a blocking finding or while final validation is missing.

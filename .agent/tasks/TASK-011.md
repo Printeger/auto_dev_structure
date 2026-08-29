@@ -4,7 +4,7 @@
 - Quality mode: `INTEGRATION`
 - Requirements: `REQ-043`, `REQ-048`, `REQ-051`, `REQ-052`, `REQ-053`, `REQ-054`
 - Milestone: `M10-V4-CODEX-PLUGIN`
-- Status: `DRAFT`
+- Status: `ACCEPTED`
 
 ## Objective
 
@@ -40,6 +40,7 @@ Make `$autodev` the working Codex-native control surface using a strict local st
 ## Evidence
 
 - Tool-list/schema/annotation snapshots, injection/process tests, validator output, installed plugin layout, and Fake end-to-end trace.
+- Accepted on 2026-08-30 by the MCP-enabled `171/171` suite, Plugin/Skill/marketplace validators, and isolated installed-wheel stdio smoke; implementation/hardening commits are `f69b8f7`, `12991ef`, and `43ea3fb`.
 
 ## Output Contract
 

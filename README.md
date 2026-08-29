@@ -1,108 +1,176 @@
-# AutoDev 3.0 alpha
+# AutoDev 4.0 alpha
 
-AutoDev 是一个面向 Codex 的本地自主开发控制平面。V3 用 Campaign 把“从粗到细”的开发阶段、累计私有 Git 基线、自动 Task 准入、分层质量门和人工升级隐藏在一个可恢复生命周期中。
+AutoDev 是一个面向 Codex 的本地自主开发控制平面。正常使用只有一条路径：
 
-当前版本是 `3.0.0a1`。它不会自动 commit、push、publish 或 deploy；达到目标时只把 Campaign 私有 checkpoint 的增量写回用户工作区。
+```text
+$autodev -> local stdio MCP -> AutoDev Core -> current Codex Commander -> fresh subagents
+```
 
-## 核心模型
+当前 Python 包版本是 `4.0.0a1`，Codex 插件版本是
+`4.0.0-alpha.1`。Core 是 `.autodev/` canonical state 的唯一写入者；当前
+Codex session 是唯一 Commander。AutoDev 不会自行提交产品改动、push、publish 或
+deploy。
 
-- 模式：`CHANGE | STAGED | CRITICAL`。
-- 阶段：`SCAFFOLD → IMPLEMENT → COMPONENT_VERIFY → INTEGRATE → HARDEN → TARGET_REACHED`。
-- 目标：`ARCHITECTURE_BASELINE | WORKING_MVP | INTEGRATED_SYSTEM | RELEASE_CANDIDATE`；CHANGE 使用隐式 `CHANGE_COMPLETE`。
-- 默认自治：`HUMAN_ON_BLOCKED`。在 Authority Envelope 内自动规划、准入和跨阶段推进。
-- Requirement Baseline：`.autodev/campaigns/CAMP-NNN/requirements.json` 是唯一真相；Markdown 报告按需派生。
+## 安装
 
-每个 Campaign 拥有 `refs/autodev/campaigns/CAMP-NNN/current`。Task worktree 从该 ref 创建，接受后用 `write-tree`、`commit-tree` 和 compare-and-swap `update-ref` 累积，不移动用户分支、不运行 hooks。目标达成前，用户工作区保持不变。
-
-## 安装与检查
+需要 Python 3.11+、Git、Codex，以及至少一个 Git commit。克隆本仓库后，在仓库根目录
+安装 Python 包与仓库内插件：
 
 ```bash
 python3 -m pip install .
 autodev version
-AUTODEV_LIVE_CODEX=1 autodev doctor --json
+autodev-mcp --version
+
+codex plugin marketplace add "$(pwd)"
+codex plugin add autodev@personal
 ```
 
-需要 Python 3.11+、Git、已登录的 Codex CLI 和至少一个 Git commit。`doctor` 会报告 App Server 人工选项为 `native` 或 `fallback`；fallback 可使用 TTY 菜单或持久化问题队列。
+然后打开一个新的 Codex thread，使 Skill 与 MCP 配置生效。插件通过本地 stdio 启动
+`autodev-mcp --stdio`，不包含 hooks 或 UI。
 
-## 启动 Campaign
+## 唯一的正常工作流
 
-交互式一体化入口：
+在要开发的 Git 项目中，显式输入 `$autodev` 和目标；Skill 不会被隐式调用：
+
+```text
+$autodev 为这个项目增加可恢复的本地全文搜索，并做到 working MVP。
+```
+
+接下来由当前 Commander 完成整个控制循环：
+
+1. 检查项目并在需要时初始化 `.autodev/`。
+2. Grill 仍会实质改变结果的决策，包括目标、development strategy、成熟度目标、
+   requirements、allowed paths、验收标准、验证命令和 Authority Envelope。
+3. 当前 Commander 生成一份结构化 Proposal；AutoDev 不再启动另一个 Planner。用户只需
+   一次明确确认，该确认同时覆盖 Proposal 与 Authority Envelope。
+4. Core 返回下一项持久 Action。Commander 为每个 Planner、Worker、Reviewer 或
+   Diagnostic Action 启动 fresh subagent；同时最多一个写入型 Worker，且它只能在
+   Action 给出的隔离 workspace 中修改。
+5. Commander 提交严格结果后继续取下一项 Action，直到 `ASK_HUMAN`、`PAUSED` 或
+   `TARGET_REACHED`。
+
+公开 Action 只有 `PLAN_PHASE`、`EXECUTE_TASK`、`RUN_IMMEDIATE_REVIEW`、
+`RUN_DIAGNOSTIC`、`RUN_PHASE_REVIEW`、`ASK_HUMAN`、`PAUSED` 和
+`TARGET_REACHED`。验证、diff/changed paths 推导、checkpoint、phase advancement 与
+materialization 判断都在 Core 内完成；Agent 对改动和测试的声明不是可信证据。
+
+`CHANGE`、`STAGED`、`CRITICAL` 是 development strategy。V3 canonical state 中仍可能
+使用兼容字段名 `mode` 保存这一策略，但它不代表运行方式选择。
+
+## 恢复、BLOCKED 与暂停
+
+pending Action 写入 `.autodev/actions/`。Commander 或进程退出后，在同一项目的新
+Codex thread 中显式调用：
+
+```text
+$autodev 继续 CAMP-001。
+```
+
+Core 会返回同一个 pending Action；不需要恢复旧对话或 specialist transcript。相同结果
+可安全重试，冲突结果、未知 Action 或 stale revision 会被拒绝且不修改 canonical state。
+
+遇到 `ASK_HUMAN`/`BLOCKED` 时，`$autodev` 只呈现 Core 持久化的问题与恢复选项。直接在
+对话中回答即可；Commander 通过 `answer_blocker` 提交答案。不要手工编辑
+`.autodev/`，也不要绕过 blocker。
+
+需要停止时，显式要求 graceful pause：
+
+```text
+$autodev 在当前 Action 安全完成后暂停 CAMP-001。
+```
+
+若已有 Action，Core 先记录 pause request，待该 Action 提交并完成确定性处理后进入
+`PAUSED`；没有 pending Action 时立即暂停。之后可在任意新的 Commander session 中用
+`$autodev 继续 CAMP-001` 恢复。恢复依赖 canonical state，不依赖模型对话历史。
+
+## Retarget 与目标写回
+
+达到目标时，Core 自动尝试一次安全 materialization，把 Campaign private checkpoint
+的累计增量写回用户工作区。它会核对 source fingerprint 并预检 patch；如果用户并发编辑
+或 patch 冲突，不会覆盖现有文件，而是进入可恢复的 `BLOCKED`。
+
+发生 materialization conflict 后，先在用户工作区解决已记录的冲突并保留需要的改动，
+再显式请求：
+
+```text
+$autodev 重试 CAMP-001 的 materialization。
+```
+
+显式 `materialize_campaign` 只用于冲突解决后的重试。成功写回只发生一次。
+
+只有已达到目标的 Campaign 才能显式 retarget 到更高成熟度：
+
+```text
+$autodev 把 CAMP-001 的目标提高到 release candidate 并继续。
+```
+
+新增 Requirement 或扩大产品 scope 时，不要把它伪装成 retarget；应从已有 checkpoint
+提出新的 Campaign。
+
+## 质量与隔离
+
+| 条件 | Core 的唯一质量路由 |
+| --- | --- |
+| 普通 LOW/MEDIUM implementation、test、docs | `NONE`：Worker 自审 + Core 确定性验证 |
+| HIGH、安全、迁移、权限扩大、公共 API、远程副作用 | `IMMEDIATE`：fresh read-only Reviewer |
+| architecture、internal interface、shared internal data、integration wiring | `PHASE`：累计阶段 diff Review |
+| 同一语义验证失败指纹连续两次 | `DIAGNOSTIC`：fresh read-only 根因诊断 |
+
+Reviewer 与 Diagnostic 必须保持只读；任何写入都会被 Core 拒绝。强制质量预算耗尽会
+`BLOCKED`，不会跳过检查。
+
+## 从 V3 迁移到 V4
+
+先在 V3 项目根目录做只读检查：
 
 ```bash
-AUTODEV_LIVE_CODEX=1 autodev start \
-  --idea "Build a local search service" \
-  --mode staged \
-  --target integrated-system
+autodev migrate v3 --check
 ```
 
-非交互环境先规划，再用 proposal hash 显式批准：
+确认检查结果后执行原子迁移：
 
 ```bash
-AUTODEV_LIVE_CODEX=1 autodev campaign plan \
-  --idea-file idea.md --mode staged --target working-mvp
-
-autodev campaign approve CAMP-001 --proposal-hash SHA256
-AUTODEV_LIVE_CODEX=1 \
-  autodev resume --campaign CAMP-001 --until target-or-blocked
+autodev migrate v3 --apply
 ```
 
-如果问题被持久化：
+迁移保留 Campaign private refs、Tasks、Evidence、checkpoint 与用户工作区内容，并在输出
+中返回 `migration_id`。如果尚未创建任何 V4 Action，可以回滚：
 
 ```bash
-AUTODEV_LIVE_CODEX=1 autodev campaign answer CAMP-001 \
-  --request HUMAN-ID --answer scope="Keep the current scope"
+autodev migrate v3 --rollback MIGRATION-ID
 ```
 
-恢复始终启动 fresh Planner/Builder/Reviewer/Diagnostic，不恢复旧聊天。
+首次调用 V4 Action Protocol 并创建 Action 后，回滚会被永久拒绝。需要回滚时必须在
+首次 `$autodev` Action 之前完成；`--check` 本身不会推进状态。
 
-## 目标与写回
+## Headless 与兼容 CLI
+
+`autodev start`、`autodev campaign start`、`autodev campaign plan/approve`、
+`autodev resume --campaign`、Codex exec/App Server engines 与 Fake engines 继续保留，
+供 headless、CI、测试、debug 和恢复基础设施使用。它们不是正常交互入口，也不是另一套
+产品工作流；需要真实模型的 legacy/headless 命令仍要求显式
+`AUTODEV_LIVE_CODEX=1`。
+
+正常的 `$autodev` MCP 路径不会启动 `autodev start`、`codex exec`、App Server、第二个
+Commander 或第二个 Proposal Planner。
+
+只读状态和派生报告仍可用于运维：
 
 ```bash
 autodev campaign status CAMP-001
-autodev campaign retarget CAMP-001 --target release-candidate
-autodev campaign materialize CAMP-001
-autodev campaign archive CAMP-001
-```
-
-`retarget` 只能提高同一 Campaign 的成熟度。新增 Requirement 或扩大产品 scope 应从已有 checkpoint 新建 Campaign。materialize 会验证记录的 source fingerprint 和 `git apply --check`；并发编辑或冲突会安全 BLOCKED。
-
-## 质量路由
-
-| 条件 | 路由 |
-| --- | --- |
-| 普通 LOW/MEDIUM implementation/test/docs | `NONE`：Builder 自审 + 确定性验证 |
-| HIGH、安全、迁移、权限扩大、公共 API、远程副作用 | `IMMEDIATE`：fresh read-only Reviewer |
-| architecture、internal interface、shared internal data、integration wiring | `PHASE`：累计阶段 diff Review |
-| 同一语义失败指纹连续两次 | `DIAGNOSTIC`：fresh read-only 根因诊断 |
-
-强制质量预算耗尽会 BLOCKED，不会跳过检查。style finding 不进入 canonical evidence。
-
-## 派生报告
-
-```bash
 autodev report phase --campaign CAMP-001
 autodev report requirements --campaign CAMP-001
 autodev report release --campaign CAMP-001
 ```
 
-Task 不同步 `DEV_LOG.md`、`CHANGES.md`、`TRACEABILITY.md`、`HANDOFF.md` 或 README。`.autodev/runs`、events、journal 和 phase summary 默认被目标项目的 `.autodev/.gitignore` 排除。
-
-## 迁移与兼容
-
-```bash
-autodev migrate v2 --check
-autodev migrate v2 --apply
-autodev migrate v2 --apply --adopt-source FINGERPRINT
-autodev migrate v2 --rollback MIGRATION-ID
-```
-
-dirty V2 项目必须提供 check 输出的精确 fingerprint 才会被采纳为初始 private checkpoint。首次 V3 状态推进前可以回滚。V1 `migrate --check|--apply|--rollback` 和 `run --until complete-or-blocked` 保留一个 alpha 兼容周期。
-
 ## 开发验证
 
 ```bash
-python -m unittest discover -s tests -v
-python -m build
+python3 -m unittest discover -s tests -v
+python3 scripts/autodev.py validate
+python3 -m build
+git diff --check
 ```
 
-普通测试使用 Fake Engine/Planner 和本地假 App Server，不调用模型。真实 smoke 仍需要显式 `AUTODEV_LIVE_CODEX=1`。
+普通测试使用 Fake Engine/Planner 和本地假 MCP/App Server，不调用模型。真实模型 Campaign
+必须另行得到明确授权。
