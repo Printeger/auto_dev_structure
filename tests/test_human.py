@@ -155,6 +155,7 @@ class HumanInteractionTests(unittest.TestCase):
                 "read(); read(); print(line({'id':1,'result':{'thread':{'id':'thr'}}}), end='', flush=True)\n"
                 "read()\n"
                 f"proposal = {proposal!r}\n"
+                "time.sleep(0.15)\n"
                 "messages = (\n"
                 "  line({'method':'item/completed','params':{'item':{'type':'agentMessage','text':json.dumps(proposal)}}}) +\n"
                 "  line({'method':'turn/completed','params':{'turn':{'id':'turn','status':'completed'}}})\n"
@@ -164,11 +165,16 @@ class HumanInteractionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             executable.chmod(0o755)
-            engine = AppServerCodexEngine(FakeHumanInteraction([]), str(executable), timeout=0.3)
+            progress: list[str] = []
+            engine = AppServerCodexEngine(
+                FakeHumanInteraction([]), str(executable), timeout=0.5,
+                heartbeat_interval=0.05, progress=progress.append,
+            )
             result = engine.plan(PlannerRequest(
                 "CAMP-001", "Build", "STAGED", "ARCHITECTURE_BASELINE", "SCAFFOLD", root,
             ))
             self.assertEqual(result["phase"], "SCAFFOLD")
+            self.assertTrue(any("working" in item.lower() for item in progress))
 
 
 if __name__ == "__main__":

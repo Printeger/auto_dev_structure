@@ -227,7 +227,11 @@ def _interaction(root: Path):
 def _planner(root: Path, interaction: object | None = None):
     interaction = interaction or _interaction(root)
     return HybridPlanner(
-        AppServerCodexEngine(interaction), CodexExecPlanner(),
+        AppServerCodexEngine(
+            interaction,
+            progress=lambda message: print(message, file=sys.stderr, flush=True),
+        ),
+        CodexExecPlanner(),
     )
 
 
@@ -424,16 +428,32 @@ def main(argv: Sequence[str] | None = None) -> int:
                     return 1
                 key, value = item.split("=", 1)
                 parsed_answers.setdefault(key, []).append(value)
+            if any(
+                value.strip().lower() == "revise batch"
+                for values in parsed_answers.values() for value in values
+            ):
+                print(
+                    "AutoDev: starting a fresh read-only Planner for the revised batch...",
+                    file=sys.stderr, flush=True,
+                )
             return _print_campaign(controller.answer(
                 arguments.campaign_id, arguments.request_id, parsed_answers,
             ))
         if arguments.campaign_command == "start":
+            print(
+                "AutoDev: executing Campaign Tasks; Codex runs may take several minutes...",
+                file=sys.stderr, flush=True,
+            )
             return _print_campaign(controller.run_until_target_or_blocked(
                 arguments.campaign_id, CodexExecEngine(), reviewer_engine=CodexExecEngine(),
             ))
 
     if arguments.command in {"run", "resume"}:
         if arguments.command == "resume" and arguments.campaign:
+            print(
+                "AutoDev: resuming Campaign Tasks; Codex runs may take several minutes...",
+                file=sys.stderr, flush=True,
+            )
             interaction = _interaction(Path.cwd())
             controller = CampaignController(
                 Path.cwd(), _planner(Path.cwd(), interaction), interaction,

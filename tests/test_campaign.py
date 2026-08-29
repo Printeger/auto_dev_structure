@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -134,6 +135,52 @@ class CampaignControllerTests(unittest.TestCase):
         self.assertEqual(set(state["tasks"]), {"TASK-001", "TASK-002"})
         contract = json.loads((self.root / ".autodev/tasks/TASK-002/contract.json").read_text())
         self.assertEqual(contract["admission"], "HUMAN_APPROVED")
+
+    def test_controller_adds_permanent_prohibitions_omitted_by_planner(self) -> None:
+        proposed_task = task()
+        proposed_task["prohibited_actions"] = []
+        controller = CampaignController(self.root, FakePlanner([proposal([proposed_task])]))
+        planned = controller.plan(CampaignRequest("Build", target="ARCHITECTURE_BASELINE"))
+
+        approved = controller.approve(
+            planned.campaign_id or "", planned.data["proposal_hash"],
+        )
+
+        self.assertEqual(approved.status, "SUCCESS", approved)
+        contract = json.loads((self.root / ".autodev/tasks/TASK-001/contract.json").read_text())
+        self.assertTrue(
+            {"commit", "push", "publish", "deploy"}.issubset(contract["prohibited_actions"])
+        )
+
+    def test_interrupted_batch_revision_stays_waiting_and_can_be_retried(self) -> None:
+        cyclic = [
+            task(task_id="TASK-001", dependencies=["TASK-002"]),
+            task(task_id="TASK-002", dependencies=["TASK-001"]),
+        ]
+        planner = FakePlanner([proposal(cyclic)])
+        controller = CampaignController(self.root, planner)
+        planned = controller.plan(CampaignRequest("Build", target="ARCHITECTURE_BASELINE"))
+        blocked = controller.approve(
+            planned.campaign_id or "", planned.data["proposal_hash"],
+        )
+        revised = proposal([task()])
+        planner.plan = mock.Mock(side_effect=[KeyboardInterrupt(), revised])
+
+        with self.assertRaises(KeyboardInterrupt):
+            controller.answer(
+                planned.campaign_id or "", blocked.data["request_id"],
+                {"decision": ["Revise batch"]},
+            )
+
+        state = json.loads((self.root / ".autodev/state.json").read_text())
+        self.assertEqual(state["campaigns"]["CAMP-001"]["status"], "WAITING_FOR_HUMAN")
+        admission = self.root / ".autodev/campaigns/CAMP-001/admission-context.json"
+        self.assertTrue(admission.is_file())
+        retried = controller.answer(
+            planned.campaign_id or "", blocked.data["request_id"],
+            {"decision": ["Revise batch"]},
+        )
+        self.assertEqual(retried.status, "SUCCESS", retried)
 
     def test_cycle_rejects_the_entire_batch(self) -> None:
         cyclic = [

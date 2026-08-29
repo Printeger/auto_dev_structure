@@ -68,6 +68,17 @@ class PackageFoundationTests(unittest.TestCase):
 
         assert_strict(schema)
 
+        def keywords(value: object):
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    yield key
+                    yield from keywords(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from keywords(child)
+
+        self.assertNotIn("uniqueItems", set(keywords(schema)))
+
 
 if __name__ == "__main__":
     unittest.main()

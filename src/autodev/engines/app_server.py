@@ -45,11 +45,15 @@ class AppServerCodexEngine:
         *,
         process_factory: Callable[..., subprocess.Popen[str]] = subprocess.Popen,
         timeout: float = 2400,
+        heartbeat_interval: float = 15,
+        progress: Callable[[str], None] | None = None,
     ) -> None:
         self.interaction = interaction
         self.executable = executable
         self.process_factory = process_factory
         self.timeout = timeout
+        self.heartbeat_interval = heartbeat_interval
+        self.progress = progress
 
     def probe(self) -> dict[str, Any]:
         try:
@@ -143,13 +147,17 @@ class AppServerCodexEngine:
         deadline = time.monotonic() + self.timeout
 
         def receive() -> dict[str, Any]:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AppServerUnavailable("app-server protocol timed out")
-            try:
-                line = stdout_lines.get(timeout=remaining)
-            except queue.Empty as error:
-                raise AppServerUnavailable("app-server protocol timed out") from error
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AppServerUnavailable("app-server protocol timed out")
+                wait_for = min(remaining, self.heartbeat_interval)
+                try:
+                    line = stdout_lines.get(timeout=wait_for)
+                    break
+                except queue.Empty:
+                    if self.progress is not None:
+                        self.progress("AutoDev: Planner is still working...")
             if line is None:
                 detail = "".join(stderr_lines)
                 raise AppServerUnavailable(detail.strip() or "app-server closed stdout")

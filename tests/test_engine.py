@@ -273,6 +273,25 @@ class CodexEngineTests(unittest.TestCase):
             self.assertEqual(result.status, "NOT_READY")
             self.assertFalse(marker.exists())
 
+    def test_execute_surfaces_structured_codex_error_on_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = self.script(
+                root,
+                "import json, sys\n"
+                "if 'sandbox' in sys.argv[1:]:\n"
+                "    raise SystemExit(0)\n"
+                "detail = {'error': {'message': \"Invalid schema: 'uniqueItems' is not permitted.\"}}\n"
+                "print(json.dumps({'type': 'error', 'message': json.dumps(detail)}), flush=True)\n"
+                "raise SystemExit(1)\n",
+            )
+            engine, request = self.request(root, executable)
+            with mock.patch.dict(os.environ, {"AUTODEV_LIVE_CODEX": "1"}):
+                result = engine.execute(request)
+            self.assertEqual(result.status, "INFRA_FAILURE")
+            self.assertIn("uniqueItems", result.infrastructure_error or "")
+            self.assertNotEqual(result.infrastructure_error, "codex exited 1")
+
     def test_protocol_error_timeout_and_stop_are_structured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

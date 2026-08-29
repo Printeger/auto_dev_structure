@@ -325,6 +325,14 @@ class CampaignController:
             review_scope = self.quality.decide(partial).value
             if review_scope == "DIAGNOSTIC":
                 review_scope = "NONE"
+            prohibited_actions = list(raw.get("prohibited_actions", []))
+            prohibited_keys = {
+                str(action).strip().lower() for action in prohibited_actions
+            }
+            for permanent in ("commit", "push", "publish", "deploy", "remote side effects"):
+                if permanent not in prohibited_keys:
+                    prohibited_actions.append(permanent)
+                    prohibited_keys.add(permanent)
             contracts.append({
                 "$schema": "https://autodev.local/schemas/task-contract.schema.json",
                 "schema_version": 1, "id": task_id,
@@ -337,9 +345,7 @@ class CampaignController:
                 "out_of_scope": list(raw.get("out_of_scope", [])),
                 "acceptance_criteria": list(raw.get("acceptance_criteria", [])),
                 "validation_commands": list(raw.get("validation_commands", [])),
-                "prohibited_actions": list(raw.get("prohibited_actions", [
-                    "commit", "push", "publish", "deploy", "remote side effects",
-                ])),
+                "prohibited_actions": prohibited_actions,
                 "created_at": _now(), "campaign_id": campaign_id, "phase": phase,
                 "admission": "AUTO_ADMITTED", "review_scope": review_scope,
             })
@@ -440,13 +446,14 @@ class CampaignController:
             if context.get("request_id") != request_id:
                 return CampaignOutcome("INVALID", "answer does not match the pending admission", campaign_id)
             selected = next(iter(response.answers.values()))[0].lower()
-            activated = self.control.execute(Command("campaign.transition", {
-                "id": campaign_id, "status": "ACTIVE",
-            }))
-            if activated.status != "SUCCESS":
-                return CampaignOutcome(activated.status, activated.message, campaign_id, activated.data)
-            already_activated = True
             if selected == "approve exception":
+                activated = self.control.execute(Command("campaign.transition", {
+                    "id": campaign_id, "status": "ACTIVE",
+                }))
+                if activated.status != "SUCCESS":
+                    return CampaignOutcome(
+                        activated.status, activated.message, campaign_id, activated.data,
+                    )
                 contracts = [dict(item, admission="HUMAN_APPROVED") for item in context["contracts"]]
                 admitted = self.control.execute(Command("task.admit_batch", {
                     "campaign_id": campaign_id, "contracts": contracts,
@@ -459,8 +466,8 @@ class CampaignController:
                     "SUCCESS", "Human-approved Task proposal batch admitted", campaign_id,
                     admitted.data,
                 )
-            # "Revise batch" continues below through a fresh Planner.
-            admission_path.unlink()
+            # "Revise batch" keeps the Campaign and admission context waiting
+            # until the fresh Planner has returned a valid replacement batch.
         gate_path = self.canonical / "campaigns" / campaign_id / "gate-context.json"
         if gate_path.is_file():
             gate = json.loads(gate_path.read_text(encoding="utf-8"))
@@ -486,12 +493,6 @@ class CampaignController:
             if advanced.status != "SUCCESS":
                 return CampaignOutcome(advanced.status, advanced.message, campaign_id, advanced.data)
             record = self._state()["campaigns"][campaign_id]
-        if not already_activated:
-            activated = self.control.execute(Command("campaign.transition", {
-                "id": campaign_id, "status": "ACTIVE",
-            }))
-            if activated.status != "SUCCESS":
-                return CampaignOutcome(activated.status, activated.message, campaign_id, activated.data)
         if self.planner is None:
             return CampaignOutcome("NOT_READY", "answer recorded; a fresh Planner is required", campaign_id)
         contract = json.loads(
@@ -521,6 +522,14 @@ class CampaignController:
             return CampaignOutcome(
                 "BLOCKED", "Planner attempted to change the approved Authority Envelope", campaign_id,
             )
+        if not already_activated:
+            activated = self.control.execute(Command("campaign.transition", {
+                "id": campaign_id, "status": "ACTIVE",
+            }))
+            if activated.status != "SUCCESS":
+                return CampaignOutcome(activated.status, activated.message, campaign_id, activated.data)
+        if admission_path.is_file():
+            admission_path.unlink()
         if proposal.get("questions"):
             _write_json_atomic(
                 self.canonical / "campaigns" / campaign_id / "phase-proposal.json",

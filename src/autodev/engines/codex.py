@@ -90,6 +90,36 @@ class CodexExecEngine:
             return "codex_configuration_error"
         return "environment_runtime_failure"
 
+    @classmethod
+    def _structured_failure_detail(cls, events: list[dict[str, Any]]) -> str | None:
+        def message(value: Any) -> str | None:
+            if isinstance(value, dict):
+                nested = value.get("error")
+                if nested is not None:
+                    detail = message(nested)
+                    if detail:
+                        return detail
+                direct = value.get("message")
+                if direct is not None:
+                    return message(direct)
+            elif isinstance(value, str):
+                rendered = value.strip()
+                if not rendered:
+                    return None
+                try:
+                    decoded = json.loads(rendered)
+                except json.JSONDecodeError:
+                    return rendered
+                return message(decoded) or rendered
+            return None
+
+        for event in reversed(events):
+            if event.get("type") in {"error", "turn.failed"}:
+                detail = message(event)
+                if detail:
+                    return detail[:2000]
+        return None
+
     def preflight(
         self, workspace: Path, *, permission_profile: str = ":workspace",
         runtime_mode: str = "codex-sandbox",
@@ -321,10 +351,14 @@ class CodexExecEngine:
                 duration_seconds=duration,
             )
         if terminal_status or process.returncode != 0:
+            failure_detail = self._structured_failure_detail(events)
             return EngineResult(
                 "INFRA_FAILURE", events=tuple(events), stdout=stdout, stderr=stderr,
                 duration_seconds=duration,
-                infrastructure_error="timeout" if terminal_status else f"codex exited {process.returncode}",
+                infrastructure_error=(
+                    "timeout" if terminal_status
+                    else failure_detail or f"codex exited {process.returncode}"
+                ),
                 failure_class=self._classify_runtime_failure(stdout + "\n" + stderr),
             )
         proposal = self._proposal(events)
