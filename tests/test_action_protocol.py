@@ -901,6 +901,12 @@ class ActionProtocolTests(unittest.TestCase):
         self.assertEqual(recovered.status, "NOT_READY", recovered)
         self.assertFalse(Path(action["workspace"]).exists())
 
+    def test_path_rejection_recovers_after_run_finish_before_operated_journal(self) -> None:
+        self._assert_rework_finish_to_operated_recovery("TRUST_REJECTION")
+
+    def test_rework_boundary_recovery_rejects_tampered_evidence(self) -> None:
+        self._assert_rework_finish_to_operated_recovery("TRUST_REJECTION", tamper=True)
+
     def test_worker_rework_and_blocked_results_are_overridden_by_actual_path_policy(self) -> None:
         campaign_id = self.approve()
         controller = ActionController(self.root)
@@ -1551,6 +1557,78 @@ class ActionProtocolTests(unittest.TestCase):
 
         self.assertEqual(recovered.status, "NOT_READY", recovered)
         self.assertFalse(Path(action["workspace"]).exists())
+
+    def test_validation_failure_recovers_after_run_finish_before_operated_journal(self) -> None:
+        self._assert_rework_finish_to_operated_recovery("VALIDATION_FAILURE")
+
+    def _assert_rework_finish_to_operated_recovery(
+        self, kind: str, *, tamper: bool = False,
+    ) -> None:
+        campaign_id = self.approve()
+        controller = ActionController(self.root)
+        action = dict(controller.get_next_action(campaign_id).action or {})
+        workspace = Path(action["workspace"])
+        if kind == "TRUST_REJECTION":
+            workspace.joinpath("outside.txt").write_text("not allowed\n", encoding="utf-8")
+        else:
+            workspace.joinpath("app.py").write_text("VALUE = 3\n", encoding="utf-8")
+        result = self.passing_result(action)
+        from autodev import action as action_module
+
+        original = action_module._write_json_atomic
+        failed_once = False
+
+        def fail_operated_journal(path: Path, value: object) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once
+                and path == self.root / f".autodev/actions/{action['id']}/finalization.json"
+                and isinstance(value, dict)
+                and value.get("phase") == "OPERATED"
+            ):
+                failed_once = True
+                raise OSError("injected REWORK operated-journal fault")
+            original(path, value)
+
+        with mock.patch.object(
+            action_module, "_write_json_atomic", side_effect=fail_operated_journal,
+        ):
+            interrupted = controller.submit_action_result(action["id"], result)
+
+        self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+        state = json.loads((self.root / ".autodev/state.json").read_text())
+        intent = json.loads(
+            (self.root / f".autodev/actions/{action['id']}/finalization.json").read_text()
+        )
+        self.assertEqual(state["tasks"]["TASK-001"]["status"], "READY")
+        self.assertEqual(state["current_action_id"], action["id"])
+        self.assertEqual(intent["phase"], "PREPARED")
+        self.assertTrue(workspace.exists())
+
+        conflicting = dict(result, summary="conflicting duplicate")
+        before = self.snapshot()
+        self.assertEqual(
+            ActionController(self.root).submit_action_result(action["id"], conflicting).status,
+            "INVALID",
+        )
+        self.assertEqual(self.snapshot(), before)
+
+        if tamper:
+            evidence_path = self.root / f".autodev/runs/{action['context']['run_id']}/evidence.json"
+            evidence = json.loads(evidence_path.read_text())
+            evidence["created_at"] = "2026-01-01T00:00:00Z"
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+            before_tampered_retry = self.snapshot()
+            rejected = ActionController(self.root).submit_action_result(action["id"], result)
+            self.assertEqual(rejected.status, "INVALID", rejected)
+            self.assertEqual(self.snapshot(), before_tampered_retry)
+            self.assertTrue(workspace.exists())
+            return
+
+        recovered = ActionController(self.root).submit_action_result(action["id"], result)
+
+        self.assertEqual(recovered.status, "NOT_READY", recovered)
+        self.assertFalse(workspace.exists())
 
     def test_validation_retry_republishes_same_diagnostic_from_identical_submit(self) -> None:
         campaign_id = self.approve()

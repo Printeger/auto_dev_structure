@@ -723,6 +723,12 @@ class ActionController:
         if not patch:
             return ActionOutcome("INVALID", "Worker produced no changes")
         validations = self._validations(contract, workspace)
+        failed = [item for item in validations if item["returncode"] != 0]
+        existing_intent = self._read_finalization(action)
+        if failed and existing_intent and existing_intent.get("kind") == "VALIDATION_FAILURE":
+            return self._resolve_validation_failure(
+                action, result, patch, changed_paths, validations,
+            )
         task_status = self._read_state()["tasks"][task_id]["status"]
         if task_status == "RUNNING":
             phased = self._control.execute(Command("run.phase", {"run_id": run_id, "to": "VALIDATING"}))
@@ -730,7 +736,6 @@ class ActionController:
                 return ActionOutcome(phased.status, phased.message, data=phased.data)
         elif task_status not in {"VALIDATING", "REVIEWING"}:
             return ActionOutcome("INFRA_FAILURE", f"cannot reconcile Task from {task_status}")
-        failed = [item for item in validations if item["returncode"] != 0]
         if failed:
             return self._resolve_validation_failure(
                 action, result, patch, changed_paths, validations,
@@ -821,7 +826,12 @@ class ActionController:
             )
             if operated is not None:
                 return operated
-            intent = self._mark_finalization(action, intent, "OPERATED")
+            try:
+                intent = self._mark_finalization(action, intent, "OPERATED")
+            except OSError as error:
+                return ActionOutcome(
+                    "INFRA_FAILURE", f"REWORK finalization must be retried: {error}",
+                )
         final = ActionOutcome("NOT_READY", message)
         return self._complete_finalization(action, submitted_result, intent, final, lambda: final)
 
@@ -869,7 +879,12 @@ class ActionController:
             )
             if operated is not None:
                 return operated
-            intent = self._mark_finalization(action, intent, "OPERATED")
+            try:
+                intent = self._mark_finalization(action, intent, "OPERATED")
+            except OSError as error:
+                return ActionOutcome(
+                    "INFRA_FAILURE", f"REWORK finalization must be retried: {error}",
+                )
         return self._finish_validation_finalization(action, result, intent, failure)
 
     def _finish_validation_finalization(
@@ -1325,12 +1340,60 @@ class ActionController:
             )
         except (OSError, json.JSONDecodeError) as error:
             return ActionOutcome("INFRA_FAILURE", f"REWORK evidence cannot be recovered: {error}")
+        if not isinstance(evidence, dict):
+            return ActionOutcome("INVALID", "REWORK evidence has an invalid contract")
         task = state.get("tasks", {}).get(action.get("task_id"), {})
+        acceptance_fields = (
+            "schema_version", "task_id", "outcome", "contract_gate_hash", "diff_hash",
+            "changed_paths", "validations", "quality_route", "findings", "debt_items",
+        )
+        acceptance = {field: evidence.get(field) for field in acceptance_fields}
+        evidence_without_id = {
+            field: value for field, value in evidence.items() if field != "evidence_id"
+        }
+        evidence_id = evidence.get("evidence_id")
+        event_matches = False
+        for event_path in sorted((self._canonical / "events").glob("*.json"), reverse=True):
+            try:
+                event = json.loads(event_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            payload = event.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            event_revision = event.get("revision")
+            if (
+                event.get("command") == "run.finish"
+                and isinstance(event_revision, int)
+                and event_revision <= state.get("revision", -1)
+                and event_path.name == f"{event_revision:020d}.json"
+                and payload.get("run_id") == run_id
+                and payload.get("task_id") == action.get("task_id")
+                and payload.get("outcome") == "REWORK"
+                and payload.get("evidence_id") == evidence_id
+            ):
+                event_matches = True
+                break
         if (
             evidence.get("action_id") != action["id"]
             or evidence.get("action_result_hash", evidence.get("result_hash"))
             != _hash(submitted_result)
-            or evidence.get("evidence_id") not in task.get("evidence_ids", [])
+            or evidence.get("result_hash") != _hash(evidence_result)
+            or evidence.get("run_id") != run_id
+            or evidence.get("task_id") != action.get("task_id")
+            or evidence.get("outcome") != "REWORK"
+            or evidence.get("diff_hash") != _hash(patch)
+            or evidence.get("changed_paths") != sorted(changed_paths)
+            or evidence.get("validations") != self._attempts.validation_evidence(validations)
+            or evidence.get("acceptance_hash") != _hash(acceptance)
+            or evidence_id != f"EVIDENCE-{_hash(evidence_without_id)}"
+            or not event_matches
+            or task.get("status") != "READY"
+            or state.get("current_action_id") != action["id"]
+            or state.get("current_run_id") is not None
+            or state.get("current_task_id") is not None
             or state.get("last_outcome") != "REWORK"
         ):
             return ActionOutcome("INVALID", "REWORK result conflicts with canonical evidence")
