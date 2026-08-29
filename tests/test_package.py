@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import sys
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -14,6 +15,7 @@ sys.path.insert(0, str(SOURCE_ROOT / "src"))
 from autodev import __version__
 from autodev._resources import _read_text, _resource_manifest
 from autodev.cli import main
+from autodev.mcp_server import main as mcp_main
 
 
 class PackageFoundationTests(unittest.TestCase):
@@ -23,6 +25,32 @@ class PackageFoundationTests(unittest.TestCase):
             result = main(["version"])
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue(), f"{__version__}\n")
+
+    def test_v4_package_metadata_declares_both_entry_points_and_dependencies(self) -> None:
+        metadata = tomllib.loads((SOURCE_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(__version__, "4.0.0a1")
+        self.assertEqual(
+            metadata["project"]["dependencies"],
+            ["jsonschema>=4.26,<5", "mcp>=2.1,<3"],
+        )
+        self.assertEqual(metadata["project"]["scripts"]["autodev"], "autodev.cli:main")
+        self.assertEqual(
+            metadata["project"]["scripts"]["autodev-mcp"],
+            "autodev.mcp_server:main",
+        )
+
+    def test_mcp_entry_point_is_importable_and_fail_closed_until_implemented(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = mcp_main(["--version"])
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "4.0.0a1\n")
+
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error):
+            result = mcp_main(["--stdio"])
+        self.assertEqual(result, 2)
+        self.assertIn("not available until the V4 MCP slice", error.getvalue())
 
     def test_manifest_resources_are_loadable(self) -> None:
         manifest = _resource_manifest()

@@ -173,7 +173,7 @@ class AppServerCodexEngine:
             send({
                 "method": "initialize", "id": 0,
                 "params": {
-                    "clientInfo": {"name": "autodev", "title": "AutoDev", "version": "3.0.0a1"},
+                    "clientInfo": {"name": "autodev", "title": "AutoDev", "version": "4.0.0a1"},
                     "capabilities": {"experimentalApi": True},
                 },
             })

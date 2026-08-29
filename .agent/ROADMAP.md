@@ -1,20 +1,38 @@
 # Roadmap
 
-## Completed: AutoDev 2.0 alpha core
+## Completed foundations
 
-- M1 Foundation: concrete project/requirement/architecture contracts, four ADRs, installable `2.0.0a1` package and resources.
-- M2 Control and migration: Draft 2020-12 schemas, fail-closed `ControlPlane`, frozen Task contracts, init, checksum-aware V1 check/apply/rollback.
-- M3 Runner: atomic directory lock, heartbeat/stale recovery, source fingerprint, one isolated worktree, binary patch checkpoint, Codex/Fake Engines, one-Task run loop.
-- M4 Quality: structured validation, independent read-only Reviewer routing, evidence hashes, protected/allowed paths and debt gate.
-- M5 Reliability/release gate: explicit continuous mode, STOP/resume, stale workspace patch recovery, semantic stagnation, budgets, derived completion, wheel/install smoke and documentation.
-- M6 Live-smoke hardening: corrected Codex 0.144.5 argv scoping, config/probe/login checks, strict output schema, three-layer live authorization, clean Git admission, direct BUILD + LOW/MEDIUM Builder routing, a reproducible greeting fixture, Codex permission profiles, and a no-model Linux sandbox preflight.
+- V2 established the installable package, canonical ControlPlane, V1 migration, isolated Runner/Engine seam, validation/review/evidence gates, reliability budgets, and live Codex hardening.
+- V3 established Campaign requirements, phase planning/admission, private CAS checkpoints, development strategies, human interaction, cumulative review, materialization, and V2 migration.
 
-## Release status
+## M7-V4-CONTRACT — V4 contract and package identity
 
-- Version remains `2.0.0a1`.
-- PyPI publishing is not part of this work.
-- The accepted BUILD + LOW smoke ran one Builder and zero Reviewers, changed only `greeting.py`, passed validation, accepted the Task, and completed the disposable project.
-- Core workflow implementation and the current acceptance gates are complete. Stable API commitment and package publication remain separate release decisions.
-- AutoDev stops on a failed no-model sandbox preflight before Task claim or model invocation. It never selects a backend or automatically falls back to danger-full-access.
-- A trusted Docker/devcontainer may use explicit `external-sandbox` mode with a second environment confirmation. Token-consuming execution still requires separate live authorization.
-- Deferred: Docker, dashboard, notifications, multi-repository execution, parallel writers/worktrees, local-commit mode, Codex SDK adapter, and native Windows process/lock semantics.
+- Freeze the single Codex-native topology and Action Protocol in project contracts and ADR-0007.
+- Set Python package version `4.0.0a1`, plugin version contract `4.0.0-alpha.1`, MCP dependency, and `autodev-mcp` entry point.
+- Add independently reviewable V4 Task contracts.
+
+## M8-V4-ACTION-CORE — Action Protocol and V3 migration
+
+- Implement strict persistent Action/Result schemas and `ActionController` with recovery-safe idempotency and revision conflict rejection.
+- Extract a shared Attempt lifecycle for workspace preparation, validation, Review/Diagnostic routing, evidence, budgets, checkpoint, progression, graceful pause, and safe materialization.
+- Add guarded `migrate v3 --check|--apply|--rollback`; forbid rollback after the first V4 Action.
+
+## M9-V4-HEADLESS-ADAPTER — Unified compatibility path
+
+- Move Campaign/RunController and Fake/Codex/App Server Engines onto the shared Attempt lifecycle.
+- Preserve existing headless commands, Fake behavior, live gates, and CLI exit codes without exposing an execution-mode selector.
+
+## M10-V4-CODEX-PLUGIN — MCP, plugin, and Skill
+
+- Implement the twelve-tool local stdio MCP boundary with strict schemas, accurate annotations, safe project-root resolution, and no Codex subprocesses.
+- Ship the explicit `$autodev` Skill and local plugin, with one Proposal confirmation, Action loop, compact Commander context, fresh subagents, and no hooks/UI.
+
+## M11-V4-RELEASE-GATE — Documentation, acceptance, and review
+
+- Make `$autodev` the README entry point and document recovery, blockers, pause/resume, retarget, materialization, and headless positioning.
+- Pass existing and new Fake/MCP/plugin/migration/package tests, validation, wheel/install smoke, and fixed-point Standards plus Spec reviews from `v3.0.0a1`.
+- Fix blocking review findings and record final handoff/state/evidence. Do not push, publish, deploy, or run an unauthorized live model Campaign.
+
+## Deferred
+
+Dashboard/UI, hooks, automatic Goal Mode, parallel writers, multi-repository execution, native Windows process/lock semantics, and any user-facing backend choice remain out of scope.

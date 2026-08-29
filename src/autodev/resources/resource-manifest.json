@@ -1,6 +1,6 @@
 {
   "$schema": "./schemas/resource-manifest.schema.json",
-  "framework_version": "3.0.0a1",
+  "framework_version": "4.0.0a1",
   "schemas": [
     "schemas/resource-manifest.schema.json",
     "schemas/manifest.schema.json",

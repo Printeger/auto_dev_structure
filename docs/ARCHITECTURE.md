@@ -1,68 +1,100 @@
-# AutoDev V3 Architecture
+# AutoDev V4 Architecture
 
 ## System context — FROZEN
 
-AutoDev is the durable authority for one repository and one writer. Codex supplies fresh, bounded Planner, Builder, Reviewer, and Diagnostic executions. Chat history is never canonical state.
+AutoDev has one normal interactive topology and one Commander:
 
 ```text
-CLI
- └─ CampaignController
-     ├─ HumanInteraction ─ App Server / TTY / persistent queue / Fake
-     ├─ ControlPlane ─ schema, frozen contracts, transitions, events
-     ├─ CampaignWorkspace ─ private ref, CAS checkpoint, journal, materialize
-     ├─ RunController ─ one Task attempt
-     └─ QualityRouter ─ NONE / IMMEDIATE / PHASE / DIAGNOSTIC
+User
+  -> current Codex CLI session
+  -> explicit $autodev Skill
+  -> local stdio AutoDev MCP
+  -> AutoDev Core / ActionController
+  -> current Codex Commander
+  -> one fresh Planner, Worker, Reviewer, or Diagnostic subagent
 ```
 
-Public seams are `CampaignController`, `CampaignRequest/Outcome`, `HumanInteraction`, `CampaignWorkspace`, `AppServerCodexEngine`, `QualityDecision`, and the retained V2-compatible `ControlPlane` and `RunController`.
+The Commander retains only compact Campaign and Action summaries. It does not edit canonical state and it does not run `autodev start`, `codex exec`, or App Server. `CodexExecEngine`, `AppServerCodexEngine`, Fake engines, and the legacy CLI remain adapters for headless, CI, test, debug, and recovery workflows. They do not create a second user-visible development mode.
 
-## Canonical ownership — FROZEN
+There is no Managed/Native distinction, `execution_backend`, or related selector. `CHANGE`, `STAGED`, and `CRITICAL` are development strategies; the persisted V3 `mode` field is a compatibility name for strategy only.
 
-`.autodev/state.json` indexes Campaign and Task state. A Campaign freezes idea, mode, target, autonomy, Requirement Baseline hash, Authority Envelope, phase sequence, proposal hash, source checkpoint, and approval time.
+## Public seams — FROZEN
 
-`.autodev/campaigns/CAMP-NNN/requirements.json` is requirement truth. `report` creates read-only Markdown views. Planner proposals cannot directly mutate or authorize canonical state; only ControlPlane can atomically admit a batch as READY.
+`ActionController` is the Codex-native deep module and exposes only:
 
-Legacy V2 Markdown requirements remain readable during the compatibility period and are imported explicitly by `migrate v2`.
+```python
+get_next_action(campaign_id) -> ActionOutcome
+submit_action_result(action_id, result) -> ActionOutcome
+```
 
-## State machines — FROZEN
+It composes the retained `ControlPlane`, `CampaignWorkspace`, `QualityRouter`, and a shared internal Attempt lifecycle. The existing `CampaignController`/`RunController` headless surface becomes an adapter over that lifecycle rather than a parallel state machine.
+
+External Actions are exactly:
+
+- `PLAN_PHASE`
+- `EXECUTE_TASK`
+- `RUN_IMMEDIATE_REVIEW`
+- `RUN_DIAGNOSTIC`
+- `RUN_PHASE_REVIEW`
+- `ASK_HUMAN`
+- `PAUSED`
+- `TARGET_REACHED`
+
+Validation, diff derivation, path enforcement, evidence production, checkpointing, phase gates, phase advancement, recovery, budgeting, and materialization decisions are deterministic Core operations and are never delegated as Actions.
+
+## Canonical ownership and Action protocol — FROZEN
+
+`.autodev/state.json` indexes Campaign, Phase, Task, Attempt, revision, `current_action_id`, and graceful `pause_requested` state. Campaign Requirement JSON remains canonical. Only Core/ControlPlane performs validated, revision-checked, atomic, evented writes.
+
+Actions are immutable JSON records below `.autodev/actions/`. Each record includes a unique ID, canonical revision, Campaign/Phase/Task identity where applicable, Core-selected `quality_route`, an isolated workspace, bounded input context, and the strict schema expected for its result.
+
+Only one Action may be pending for a Campaign. Repeated `get_next_action` calls return that exact record until it is resolved. Result submission is keyed by Action ID and expected canonical revision:
+
+- an identical already-accepted result returns the recorded outcome without mutation;
+- a different duplicate, unknown ID, stale revision, or malformed result is rejected without mutation;
+- a crash between durable steps is reconciled from canonical state, Action records, journals, refs, and evidence rather than agent memory.
+
+## State machines and development strategy — FROZEN
 
 - Project: `BOOTSTRAP | IDLE | ACTIVE | PAUSED | BLOCKED | STOPPED | FAILED`. Legacy `COMPLETE` remains schema-readable for migration only.
 - Campaign: `PROPOSED | ACTIVE | WAITING_FOR_HUMAN | TARGET_REACHED | ARCHIVED | CANCELLED`.
 - Phase: `SCAFFOLD | IMPLEMENT | COMPONENT_VERIFY | INTEGRATE | HARDEN | TARGET_REACHED`.
-- Task mainline remains `DRAFT/READY → CLAIMED → RUNNING → VALIDATING → [REVIEWING] → ACCEPTED`.
+- Task mainline: `DRAFT/READY -> CLAIMED -> RUNNING -> VALIDATING -> [REVIEWING] -> ACCEPTED`.
 
-CHANGE has one IMPLEMENT phase. STAGED and CRITICAL retain the full phase sequence and stop at their selected target. Retarget only advances maturity.
+`CHANGE` uses one IMPLEMENT phase. `STAGED` and `CRITICAL` retain the full phase sequence and stop at the selected maturity target; only monotonic retargeting is permitted. These are development strategies, including when read from the V3 compatibility field `mode`.
 
-## Private checkpoint protocol — FROZEN
+## Attempt lifecycle and trust boundary — FROZEN
 
-Campaign approval creates `refs/autodev/campaigns/CAMP-NNN/current` at the approved source commit and records the user-tree fingerprint. Each Task worktree starts at the current private ref.
+Core creates a Campaign worktree and returns the applicable isolated workspace in the Action. A Worker is the only writing specialist, must operate only in that workspace, and at most one Worker may run. Core independently derives the binary diff, changed paths, source/concurrency checks, validations, evidence, and checkpoint transition. Agent-provided changed-file and validation fields are claims, never authority.
 
-Acceptance stages the worktree, creates a tree and parented commit with Git plumbing, writes a PREPARED journal, compare-and-swaps the ref, updates canonical state, then marks the journal COMMITTED. Recovery completes only states provable from the journal, ref, and acceptance evidence; divergence fails closed.
+Planner, Reviewer, and Diagnostic specialists are fresh and read-only. Core verifies their workspace did not change and rejects a result if it did. Review routing comes only from `QualityRouter`: ordinary LOW/MEDIUM work is `NONE`, high impact is `IMMEDIATE`, cumulative architecture/internal integration is `PHASE`, and repeated identical semantic failure is `DIAGNOSTIC`.
 
-The user branch and worktree do not move during development. At target, AutoDev computes one binary diff from the last materialized checkpoint, verifies source fingerprint and `git apply --check`, applies it, and records the new materialized checkpoint. No product commit is created.
+The shared internal Attempt lifecycle owns workspace policy, validation, quality routing, budgets, evidence, private CAS checkpoints, and recovery. Codex-native Actions and headless Engines adapt their transport-specific result into that one lifecycle.
 
-## Planner and admission — FROZEN
+## Campaign and materialization — FROZEN
 
-Every phase uses a fresh Planner session. The default envelope permits up to MEDIUM risk, implementation/test/documentation/architecture/internal-interface/shared-internal-data, and existing dependencies only. Public API, security, migration, permission expansion, and remote side effects require human authority; commit/push/publish/deploy remain forbidden.
+Campaign approval creates `refs/autodev/campaigns/CAMP-NNN/current` at the approved source commit and records the user-tree fingerprint. Accepted Tasks advance the private ref with journaled compare-and-swap. The user branch/worktree stays unchanged during development.
 
-Batch admission checks identity, active phase, requirement references, risk, change classes, protected paths, validation argv/cwd policy, prohibited actions, known dependencies, and DAG acyclicity. One violation rejects the whole batch and creates the smallest human decision.
+When the target invariant is reached, Core automatically attempts exactly one safe materialization of the private checkpoint increment. It verifies the source fingerprint and binary apply preconditions, never creates a product commit, and records the materialized checkpoint. A conflict enters `ASK_HUMAN`/BLOCKED without overwriting user changes. `materialize_campaign` is an explicit retry after the conflict is resolved.
 
-## Human interaction — PROVISIONAL
+Pause is a request, not an interrupt: `pause_requested` takes effect after the current external Action is submitted and all deterministic processing completes. The next outcome is `PAUSED`. Continue reconciles state and returns the existing pending Action or the next derived Action.
 
-The Planner prefers Codex App Server JSONL with `experimentalApi=true`. AutoDev handles server-initiated `item/tool/requestUserInput`, 1–3 questions, 2–3 options, free-form `isOther`, and `autoResolutionMs`. The experimental transport is isolated behind `HumanInteraction`.
+## Proposal and human interaction — FROZEN
 
-Protocol/startup failure falls back to fresh `codex exec` plus TTY or persisted questions. Headless requests enter a recoverable waiting path. Secret questions are sanitized and never store answers; credentials must arrive through a controlled environment.
+The current Codex performs the Grill and supplies a strict structured Proposal to `propose_campaign`. Core validates and hashes it but never launches App Server or a second Planner. The user confirms the Proposal and Authority Envelope once through the Skill before `approve_campaign`.
 
-## Quality and evidence — FROZEN
+Human interaction after approval occurs only for genuine blockers, Authority Envelope exceptions, CRITICAL gates, environment/credential requirements, materialization conflicts, or exhausted mandatory budgets. Answers are applied through Core; secrets are never persisted.
 
-`QualityRouter.decide` is the only routing interface. Immediate Review handles high-impact changes. Architecture and internal integration are reviewed once per cumulative phase. Repeated identical semantic failure routes to one read-only Diagnostic; Diagnostic proposes cause and repair direction but never accepts work.
+## MCP boundary — FROZEN
 
-Default budgets are one Review plus rereview per immediate Task, one Review plus rereview per Phase, one Diagnostic per Task, and at most five blocking plus five debt findings. Mandatory budget exhaustion blocks.
+The local stdio server exposes only:
 
-Run logs, events, journals, and phase summaries are operational evidence, ignored from product Git history by default. Governance Markdown is not a Task output.
+`inspect_project`, `initialize_project`, `propose_campaign`, `approve_campaign`, `campaign_status`, `campaign_continue`, `pause_campaign`, `answer_blocker`, `retarget_campaign`, `materialize_campaign`, `get_next_action`, and `submit_action_result`.
 
-## CLI — FROZEN
+Every tool explicitly accepts `project_root`, publishes strict input/output schemas and accurate read-only/destructive/idempotent/open-world annotations, resolves the root without shell interpretation, and maps Core failures to stable MCP errors. Mutating tools call only Core/ControlPlane APIs. No MCP request launches a Codex subprocess.
 
-The V3 surface is `start`, `campaign plan|approve|status|answer|retarget|start|materialize|archive`, `resume --campaign --until target-or-blocked`, `report phase|requirements|release`, and `migrate v2 --check|--apply|--rollback`.
+## Migration and compatibility — PROVISIONAL
 
-Exit codes remain 0 success, 1 invalid, 2 not ready/paused, 3 blocked, 4 stopped, and 5 infrastructure failure. Live model execution requires exact `AUTODEV_LIVE_CODEX=1`.
+`autodev migrate v3 --check|--apply|--rollback` preserves Campaign private refs, Tasks, Evidence, checkpoints, and compatibility strategy fields. Check is read-only; apply is staged and validated; rollback is guarded and is permanently refused after the first V4 Action is created.
+
+Legacy `autodev start`, `campaign start`, and `resume --campaign` retain stable exit codes 0 success, 1 invalid, 2 not ready/paused, 3 blocked, 4 stopped, and 5 infrastructure failure. Their execution engines use the shared Attempt lifecycle and remain outside the normal README path.

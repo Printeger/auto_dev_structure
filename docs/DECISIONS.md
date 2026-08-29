@@ -10,3 +10,4 @@ Durable decisions live as individual files under `docs/decisions/`. Add one inde
 | [ADR-0004](decisions/ADR-0004-quality-routing.md) | Route independent review by risk and change class | ACCEPTED | 2026-08-28 |
 | [ADR-0005](decisions/ADR-0005-private-campaign-checkpoints.md) | Accumulate Campaign work on a private Git ref with journaled CAS | ACCEPTED | 2026-08-29 |
 | [ADR-0006](decisions/ADR-0006-app-server-human-interaction.md) | Isolate experimental App Server input behind HumanInteraction | ACCEPTED | 2026-08-29 |
+| [ADR-0007](decisions/ADR-0007-codex-native-action-protocol.md) | Use one Codex-native workflow and a persistent Core-owned Action Protocol | ACCEPTED | 2026-08-30 |

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-__version__ = "3.0.0a1"
+__version__ = "4.0.0a1"
 
 from autodev.control_plane import Command, CommandResult, ControlPlane
 from autodev.run_controller import RunController, RunOutcome, RunRequest

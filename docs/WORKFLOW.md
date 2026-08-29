@@ -1,17 +1,16 @@
-# AutoDev V3 Workflow
+# AutoDev V4 Workflow
 
-1. `campaign plan` runs a fresh read-only Planner, asks at most three directional questions, and emits a hashed proposal.
-2. `campaign approve` freezes Requirement JSON and Authority Envelope and creates the private Campaign ref.
-3. ControlPlane atomically admits the first phase Task batch when every Task stays inside the envelope.
-4. RunController executes one Task from the current private checkpoint. Accepted work advances only the private ref.
-5. When all phase Tasks are accepted, Phase Gate runs cumulative validation. Architecture/internal interface work receives one cumulative Phase Review.
-6. A passed gate writes a phase summary, advances phase, and launches a fresh Planner. No intermediate human approval is needed in STAGED mode.
-7. Two identical semantic failure fingerprints launch one fresh read-only Diagnostic, followed by repair planning.
-8. At the selected target, STAGED writes the full incremental binary patch to the unchanged user worktree. CRITICAL first persists a human gate.
-9. The user may raise maturity with `retarget`, derive reports, or archive after all results are materialized.
+1. The user explicitly invokes `$autodev` in Codex and states an idea, maturity target, and constraints in natural language.
+2. The current Codex grills only on decisions that materially affect scope, architecture, or authority, inspects/initializes through MCP, and creates one strict structured Proposal locally.
+3. `propose_campaign` validates and hashes that supplied Proposal. The Skill presents the Proposal and Authority Envelope once; the user confirms once; `approve_campaign` freezes them and creates the Campaign private ref/worktree.
+4. The Commander calls `get_next_action`. Core completes any deterministic work first and returns the same pending Action until it receives an admissible result.
+5. For `PLAN_PHASE`, `EXECUTE_TASK`, `RUN_IMMEDIATE_REVIEW`, `RUN_DIAGNOSTIC`, or `RUN_PHASE_REVIEW`, the Commander starts one fresh matching subagent. Only a Worker may write, only in the Action workspace, and only one Worker may exist at once.
+6. The Commander submits the strict result to `submit_action_result`. Core distrusts claims, derives workspace changes and validation itself, enforces paths and read-only roles, routes quality through the sole `QualityRouter`, records evidence, checkpoints accepted work, and advances state.
+7. The Commander repeats from `get_next_action`, retaining only the Campaign/Action summary. It does not run `autodev start`, `codex exec`, App Server, or a second planning loop.
+8. `pause_campaign` sets a graceful request. The current Action finishes, deterministic processing completes, and the next outcome is `PAUSED`. A later Codex session uses `$autodev` and `campaign_continue` to reconcile and resume from canonical state.
+9. `ASK_HUMAN` is returned only for a genuine blocker or mandatory gate. The Skill submits the answer through `answer_blocker`; it never edits `.autodev/` directly.
+10. When target invariants pass, Core attempts safe materialization once. Success returns `TARGET_REACHED`; a concurrent-change or apply conflict returns `ASK_HUMAN` without overwriting files. After the user resolves the conflict, `materialize_campaign` retries explicitly.
 
-Human escalation occurs only for envelope exceptions, genuine blockers, CRITICAL gates, target completion, credential/environment needs, write-back conflicts, or exhausted mandatory budgets.
+`CHANGE`, `STAGED`, and `CRITICAL` select development strategy and quality depth, not execution infrastructure. There is one normal workflow and no backend selector.
 
-Resume never restores a model conversation. It reconciles journals and canonical evidence, then starts a fresh Planner or specialist execution.
-
-V2 projects use `autodev migrate v2 --check` before applying. Dirty accepted source requires the exact reported fingerprint. Rollback is allowed only before the first V3 state revision.
+The retained headless CLI and Engines adapt to the same Core/Attempt lifecycle for CI, tests, debugging, and recovery. They are compatibility infrastructure, not instructions for ordinary `$autodev` use.
