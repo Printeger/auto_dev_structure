@@ -643,10 +643,13 @@ class ActionController:
             "diff_hash": _hash(patch), "changed_paths": changed_paths,
         }
         _write_json_atomic(self._canonical / "runs" / run_id / "failure.json", failure)
-        self._write_evidence(action, result, patch, changed_paths, validations, None)
-        finished = self._control.execute(Command("run.finish", {
-            "run_id": run_id, "outcome": "REWORK",
-        }))
+        evidence_result = {**result, "outcome": "REWORK"}
+        evidence_id = self._write_evidence(
+            action, evidence_result, patch, changed_paths, validations, None,
+        )
+        finished = self._attempts.finish(
+            run_id=run_id, outcome="REWORK", evidence_id=evidence_id,
+        )
         if finished.status != "SUCCESS":
             return ActionOutcome(finished.status, finished.message, data=finished.data)
         resolved = self._resolve(
@@ -962,21 +965,28 @@ class ActionController:
                 "INVALID", "debt gate rejected Action result", data={"errors": debt_errors},
             )
         pause_after_action = bool(self._read_state().get("pause_requested"))
+        evidence_id: str | None = None
+
+        def write_acceptance_evidence(checkpoint: Any) -> None:
+            nonlocal evidence_id
+            evidence_id = self._write_evidence(
+                action, result, patch, changed_paths, validations, checkpoint.commit,
+                action_result=submitted_result or result,
+            )
+
         try:
             checkpoint = self._attempts.recover_or_checkpoint(
                 campaign_id=campaign_id, workspace=workspace, task_id=task_id, run_id=run_id,
+                before_record=write_acceptance_evidence,
             )
         except CampaignWorkspaceError as error:
             return ActionOutcome("INFRA_FAILURE", f"checkpoint failed: {error}")
-        evidence_id = self._write_evidence(
-            action, result, patch, changed_paths, validations, checkpoint.commit,
-            action_result=submitted_result or result,
+        if evidence_id is None:
+            return ActionOutcome("INFRA_FAILURE", "checkpoint evidence was not produced")
+        finished = self._attempts.finish(
+            run_id=run_id, outcome=str(result["outcome"]), evidence_id=evidence_id,
+            checkpoint_id=checkpoint.commit, result=result,
         )
-        finished = self._control.execute(Command("run.finish", {
-            "run_id": run_id, "outcome": result["outcome"], "evidence_id": evidence_id,
-            "checkpoint_id": checkpoint.commit,
-            "debt_items": result["data"].get("debt_items", []),
-        }))
         if finished.status != "SUCCESS":
             return ActionOutcome(finished.status, finished.message, data=finished.data)
         cleanup = self._safe_cleanup(campaign_id, workspace)
@@ -1053,13 +1063,12 @@ class ActionController:
     ) -> ActionOutcome:
         run_id = str(action["context"]["run_id"])
         outcome = result["outcome"]
-        arguments: dict[str, Any] = {"run_id": run_id, "outcome": outcome}
-        if outcome == "BLOCKED":
-            arguments.update(blocker=result["blocker"], next_action=result["next_action"])
-        self._write_evidence(
+        evidence_id = self._write_evidence(
             action, result, patch or b"", changed_paths or [], [], None,
         )
-        finished = self._control.execute(Command("run.finish", arguments))
+        finished = self._attempts.finish(
+            run_id=run_id, outcome=outcome, evidence_id=evidence_id, result=result,
+        )
         if finished.status != "SUCCESS":
             return ActionOutcome(finished.status, finished.message, data=finished.data)
         CampaignWorkspace(self._root, str(action["campaign_id"])).remove_task_workspace(
@@ -1091,22 +1100,18 @@ class ActionController:
         *, action_result: Mapping[str, Any] | None = None,
     ) -> str:
         run_id = str(action["context"]["run_id"])
-        evidence = {
-            "task_id": action["task_id"], "run_id": run_id,
-            "outcome": result["outcome"], "created_at": _now(),
-            "action_id": action["id"], "result_hash": _hash(result),
-            "action_result_hash": _hash(action_result or result),
-            "diff_hash": _hash(patch), "changed_paths": changed_paths,
-            "validations": [
-                {"argv": item["argv"], "returncode": item["returncode"],
-                 "timed_out": item["timed_out"], "log_hash": _hash(item)}
-                for item in validations
-            ],
-            "checkpoint_id": checkpoint,
-        }
-        evidence_id = f"EVIDENCE-{_hash(evidence)}"
-        evidence["evidence_id"] = evidence_id
-        _write_json_atomic(self._canonical / "runs" / run_id / "evidence.json", evidence)
+        evidence_id, _ = self._attempts.write_evidence(
+            run_dir=self._canonical / "runs" / run_id,
+            task_id=str(action["task_id"]), run_id=run_id, outcome=str(result["outcome"]),
+            contract=self._contract_for(action), patch=patch, changed_paths=changed_paths,
+            validations=validations, quality_route=str(action["quality_route"]),
+            checkpoint_id=checkpoint, result=result,
+            extra={
+                "action_id": action["id"],
+                "action_result_hash": _hash(action_result or result),
+                "contract_hash": action["context"]["contract_hash"],
+            },
+        )
         return evidence_id
 
     @staticmethod

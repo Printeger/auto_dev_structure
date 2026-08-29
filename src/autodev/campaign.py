@@ -648,23 +648,10 @@ class CampaignController:
                     if key not in seen:
                         commands.append(validation)
                         seen.add(key)
-            for validation in commands:
-                try:
-                    process = subprocess.run(
-                        validation["argv"], cwd=worktree / validation["cwd"], shell=False,
-                        capture_output=True, text=True, timeout=validation["timeout"], check=False,
-                    )
-                    validations.append({
-                        "argv": validation["argv"], "cwd": validation["cwd"],
-                        "returncode": process.returncode, "stdout": process.stdout,
-                        "stderr": process.stderr, "timed_out": False,
-                    })
-                except subprocess.TimeoutExpired as error:
-                    validations.append({
-                        "argv": validation["argv"], "cwd": validation["cwd"],
-                        "returncode": None, "stdout": str(error.stdout or ""),
-                        "stderr": str(error.stderr or ""), "timed_out": True,
-                    })
+            validations = self.attempts.run_validations(
+                {"validation_commands": commands}, worktree,
+                self.canonical / "runs" / gate_id,
+            )
             failed = [item for item in validations if item["returncode"] != 0]
             if failed:
                 summary = {
@@ -1024,10 +1011,10 @@ class CampaignController:
                     or evidence.get("outcome") not in {"PASS", "PASS_WITH_DEBT"}
                 ):
                     raise CampaignWorkspaceError("checkpoint evidence does not prove Task acceptance")
-                finished = self.control.execute(Command("run.finish", {
-                    "run_id": journal["run_id"], "outcome": evidence["outcome"],
-                    "evidence_id": evidence["evidence_id"], "checkpoint_id": journal["commit"],
-                }))
+                finished = self.attempts.finish(
+                    run_id=journal["run_id"], outcome=evidence["outcome"],
+                    evidence_id=evidence["evidence_id"], checkpoint_id=journal["commit"],
+                )
                 if finished.status != "SUCCESS":
                     raise CampaignWorkspaceError(finished.message)
                 return finished.revision or result.revision or 0

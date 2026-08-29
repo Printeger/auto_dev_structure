@@ -7,8 +7,9 @@ import json
 import subprocess
 import time
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from autodev._workspace import GitWorkspace, _write_json_atomic
 from autodev.campaign_workspace import (
@@ -16,7 +17,7 @@ from autodev.campaign_workspace import (
     CampaignWorkspaceError,
     CheckpointResult,
 )
-from autodev.control_plane import Command, ControlPlane
+from autodev.control_plane import Command, CommandResult, ControlPlane
 from autodev.quality import QualityBudget, QualityRouter, validate_debt
 
 
@@ -25,6 +26,14 @@ def canonical_hash(value: Any) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
     ).encode()
     return hashlib.sha256(content).hexdigest()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class CheckpointPublicationPending(CampaignWorkspaceError):
+    """A private checkpoint is durable but canonical publication must be retried."""
 
 
 class AttemptLifecycle:
@@ -108,8 +117,140 @@ class AttemptLifecycle:
             errors.append("Review exceeded the debt finding budget")
         return errors
 
+    def finish(
+        self, *, run_id: str, outcome: str, evidence_id: str | None = None,
+        checkpoint_id: str | None = None, result: Mapping[str, Any] | None = None,
+    ) -> CommandResult:
+        """Record an attempt outcome through the one canonical writer."""
+
+        arguments: dict[str, Any] = {
+            "run_id": run_id, "outcome": outcome,
+            "evidence_id": evidence_id, "checkpoint_id": checkpoint_id,
+        }
+        if result:
+            data = result.get("data", {})
+            debt_items = data.get("debt_items", []) if isinstance(data, Mapping) else []
+            if not debt_items:
+                debt_items = result.get("debt_items", [])
+            arguments.update(
+                blocker=result.get("blocker"), next_action=result.get("next_action"),
+                debt_items=debt_items,
+            )
+        return self.control.execute(Command("run.finish", arguments))
+
+    @staticmethod
+    def public_status(outcome: str) -> str:
+        return {
+            "PASS": "SUCCESS", "PASS_WITH_DEBT": "SUCCESS",
+            "REWORK": "NOT_READY", "NO_PROGRESS": "NOT_READY",
+            "INFRA_FAILURE": "INFRA_FAILURE", "BLOCKED": "BLOCKED", "STOPPED": "STOPPED",
+        }[outcome]
+
+    @staticmethod
+    def contract_gate_hash(contract: Mapping[str, Any]) -> str:
+        """Hash only the frozen trust inputs that decide attempt acceptance."""
+
+        fields = (
+            "id", "objective", "requirements", "dependencies", "priority", "blocking",
+            "risk", "quality_mode", "change_classes", "allowed_paths", "out_of_scope",
+            "acceptance_criteria", "validation_commands", "prohibited_actions", "review_scope",
+        )
+        return canonical_hash({field: contract.get(field) for field in fields})
+
+    @staticmethod
+    def validation_evidence(validations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Project validation results without timing or adapter-specific fields."""
+
+        evidence: list[dict[str, Any]] = []
+        for item in validations:
+            log = {
+                "argv": item["argv"], "cwd": item.get("cwd", "."),
+                "returncode": item["returncode"], "timed_out": item["timed_out"],
+                "stdout": item.get("stdout", ""), "stderr": item.get("stderr", ""),
+            }
+            evidence.append({
+                "argv": log["argv"], "cwd": log["cwd"],
+                "returncode": log["returncode"], "timed_out": log["timed_out"],
+                "log_hash": canonical_hash(log),
+            })
+        return evidence
+
+    @staticmethod
+    def stagnation_fingerprint(
+        task_id: str, phase: str, patch: bytes, validations: list[dict[str, Any]],
+        findings: list[str],
+    ) -> str:
+        value = {
+            "task_id": task_id, "phase": phase,
+            "diff_hash": hashlib.sha256(patch).hexdigest(),
+            "failed_checks": [
+                {
+                    "argv": item["argv"], "returncode": item["returncode"],
+                    "timed_out": item["timed_out"],
+                }
+                for item in validations if item["returncode"] != 0
+            ],
+            "blocking_findings": sorted(findings),
+        }
+        return canonical_hash(value)
+
+    def write_evidence(
+        self, *, run_dir: Path, task_id: str, run_id: str, outcome: str,
+        contract: Mapping[str, Any], patch: bytes, changed_paths: list[str],
+        validations: list[dict[str, Any]], quality_route: str,
+        checkpoint_id: str | None, result: Mapping[str, Any] | None = None,
+        review: Mapping[str, Any] | None = None, extra: Mapping[str, Any] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Persist one canonical evidence envelope for every attempt adapter."""
+
+        projected_validations = self.validation_evidence(validations)
+        decision = review if review is not None else (result or {})
+        decision_data = decision.get("data", {})
+        debt_items = (
+            decision_data.get("debt_items", [])
+            if isinstance(decision_data, Mapping) else []
+        )
+        if not debt_items:
+            debt_items = decision.get("debt_items", [])
+        acceptance = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "outcome": outcome,
+            "contract_gate_hash": self.contract_gate_hash(contract),
+            "diff_hash": hashlib.sha256(patch).hexdigest(),
+            "changed_paths": sorted(changed_paths),
+            "validations": projected_validations,
+            "quality_route": quality_route,
+            "findings": decision.get("findings", []),
+            "debt_items": debt_items,
+        }
+        evidence: dict[str, Any] = {
+            **acceptance,
+            "run_id": run_id,
+            "created_at": _now(),
+            "checkpoint_id": checkpoint_id,
+            "stagnation_fingerprint": self.stagnation_fingerprint(
+                task_id, "REVIEWING" if review else "VALIDATING", patch, validations,
+                list((review or {}).get("findings", [])),
+            ),
+            "acceptance_hash": canonical_hash(acceptance),
+        }
+        if result is not None:
+            evidence["result_hash"] = canonical_hash(result)
+        if review is not None:
+            evidence["review_hash"] = canonical_hash(review)
+        else:
+            evidence["review_hash"] = None
+        if extra:
+            evidence.update(extra)
+        evidence_id = f"EVIDENCE-{canonical_hash(evidence)}"
+        evidence["evidence_id"] = evidence_id
+        _write_json_atomic(run_dir / "evidence.json", evidence)
+        return evidence_id, evidence
+
     def recover_or_checkpoint(
         self, *, campaign_id: str, workspace: Path, task_id: str, run_id: str,
+        before_record: Callable[[CheckpointResult], None] | None = None,
     ) -> CheckpointResult:
         owner = CampaignWorkspace(self.root, campaign_id)
         journal_path = owner.journals / f"{run_id}.json"
@@ -126,12 +267,20 @@ class AttemptLifecycle:
             )
         else:
             checkpoint = owner.checkpoint(workspace, task_id=task_id, run_id=run_id)
+        if before_record is not None:
+            before_record(checkpoint)
         state = json.loads((self.canonical / "state.json").read_text(encoding="utf-8"))
         if state["campaigns"][campaign_id]["checkpoint"] != checkpoint.commit:
             recorded = self.control.execute(Command("campaign.checkpoint", {
                 "id": campaign_id, "checkpoint": checkpoint.commit, "task_id": task_id,
             }))
             if recorded.status != "SUCCESS":
+                journal = json.loads(checkpoint.journal_path.read_text(encoding="utf-8"))
+                if (
+                    journal.get("phase") == "REF_UPDATED"
+                    and owner.current_commit == checkpoint.commit
+                ):
+                    raise CheckpointPublicationPending(recorded.message)
                 raise CampaignWorkspaceError(recorded.message)
             revision = recorded.revision or 0
         else:

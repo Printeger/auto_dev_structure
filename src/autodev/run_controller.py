@@ -26,7 +26,7 @@ from autodev._workspace import (
     recover_stale_workspaces,
     source_fingerprint,
 )
-from autodev.attempt_lifecycle import AttemptLifecycle
+from autodev.attempt_lifecycle import AttemptLifecycle, CheckpointPublicationPending
 from autodev.campaign_workspace import CampaignWorkspace, CampaignWorkspaceError
 from autodev.control_plane import Command, ControlPlane
 from autodev.engines import AttemptRequest, EngineResult, ExecutionEngine
@@ -241,71 +241,36 @@ class RunController:
     def _validations(self, contract: dict[str, Any], workspace: Path, artifact_dir: Path) -> list[dict[str, Any]]:
         return self.attempts.run_validations(contract, workspace, artifact_dir)
 
-    @staticmethod
-    def _stagnation_fingerprint(
-        task_id: str, phase: str, patch: bytes, validations: list[dict[str, Any]], findings: list[str]
-    ) -> str:
-        value = {
-            "task_id": task_id, "phase": phase, "diff_hash": _hash(patch),
-            "failed_checks": [
-                {"argv": item["argv"], "returncode": item["returncode"], "timed_out": item["timed_out"]}
-                for item in validations if item["returncode"] != 0
-            ],
-            "blocking_findings": sorted(findings),
-        }
-        return _hash(value)
-
     def _write_evidence(
         self, run_dir: Path, task_id: str, run_id: str, outcome: str,
         contract: dict[str, Any], proposal: dict[str, Any], patch: bytes,
         validations: list[dict[str, Any]], review: dict[str, Any] | None,
-        checkpoint_id: str | None,
+        checkpoint_id: str | None, *, changed_paths: list[str] | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        evidence = {
-            "task_id": task_id, "run_id": run_id, "outcome": outcome,
-            "created_at": _now(),
+        return self.attempts.write_evidence(
+            run_dir=run_dir, task_id=task_id, run_id=run_id, outcome=outcome,
+            contract=contract, patch=patch, changed_paths=changed_paths or [],
+            validations=validations, quality_route=str(contract.get("review_scope", "NONE")),
+            checkpoint_id=checkpoint_id, result=proposal, review=review,
+            extra={
             "contract_hash": self._state()["tasks"][task_id]["contract_hash"],
-            "proposal_hash": _hash(proposal), "diff_hash": _hash(patch),
-            "validations": [
-                {"argv": item["argv"], "returncode": item["returncode"],
-                 "timed_out": item["timed_out"], "log_hash": _hash(item)}
-                for item in validations
-            ],
-            "review_hash": _hash(review) if review else None,
-            "checkpoint_id": checkpoint_id,
-            "stagnation_fingerprint": self._stagnation_fingerprint(
-                task_id, "REVIEWING" if review else "VALIDATING", patch, validations,
-                list((review or {}).get("findings", [])),
-            ),
-        }
-        evidence_id = f"EVIDENCE-{_hash(evidence)}"
-        evidence["evidence_id"] = evidence_id
-        _write_json_atomic(run_dir / "evidence.json", evidence)
-        return evidence_id, evidence
+            "proposal_hash": _hash(proposal),
+            },
+        )
 
     def _finish(
         self, run_id: str, outcome: str, *, evidence_id: str | None = None,
         checkpoint_id: str | None = None, proposal: Mapping[str, Any] | None = None,
         failure_class: str | None = None,
     ) -> RunOutcome:
-        arguments: dict[str, Any] = {
-            "run_id": run_id, "outcome": outcome, "evidence_id": evidence_id,
-            "checkpoint_id": checkpoint_id,
-        }
-        if proposal:
-            arguments.update(
-                blocker=proposal.get("blocker"), next_action=proposal.get("next_action"),
-                debt_items=proposal.get("debt_items", []),
-            )
-        result = self.control.execute(Command("run.finish", arguments))
+        result = self.attempts.finish(
+            run_id=run_id, outcome=outcome, evidence_id=evidence_id,
+            checkpoint_id=checkpoint_id, result=proposal,
+        )
         if result.status != "SUCCESS":
             status = result.status
         else:
-            status = {
-                "PASS": "SUCCESS", "PASS_WITH_DEBT": "SUCCESS",
-                "REWORK": "NOT_READY", "NO_PROGRESS": "NOT_READY",
-                "INFRA_FAILURE": "INFRA_FAILURE", "BLOCKED": "BLOCKED", "STOPPED": "STOPPED",
-            }[outcome]
+            status = self.attempts.public_status(outcome)
         data = dict(result.data)
         if failure_class is None and outcome in {"BLOCKED", "REWORK", "NO_PROGRESS"}:
             failure_class = "agent_task_failure"
@@ -405,7 +370,8 @@ class RunController:
         if not patch or any(item["returncode"] != 0 for item in validations):
             outcome = "NO_PROGRESS" if not patch else "REWORK"
             evidence_id, evidence = self._write_evidence(
-                run_dir, task_id, run_id, outcome, contract, proposal, patch, validations, None, None
+                run_dir, task_id, run_id, outcome, contract, proposal, patch, validations, None, None,
+                changed_paths=changed_paths,
             )
             fingerprints = [
                 item.get("stagnation_fingerprint", "") for item in history
@@ -501,7 +467,7 @@ class RunController:
                         review["next_action"] = "Resolve the Reviewer blocker."
                 evidence_id, _ = self._write_evidence(
                     run_dir, task_id, run_id, review["outcome"], contract, proposal,
-                    patch, validations, review, None,
+                    patch, validations, review, None, changed_paths=changed_paths,
                 )
                 workspace.cleanup()
                 return self._finish(run_id, review["outcome"], evidence_id=evidence_id, proposal=review)
@@ -515,14 +481,30 @@ class RunController:
             if debt_errors:
                 workspace.cleanup()
                 return self._finish(run_id, "REWORK", proposal={"summary": "; ".join(debt_errors)})
+        evidence_id: str | None = None
         if campaign_workspace is None:
             checkpoint_path = workspace.checkpoint(patch, changed_paths)
             checkpoint_id = _hash(checkpoint_path.read_bytes())
         else:
+            def write_acceptance_evidence(checkpoint: Any) -> None:
+                nonlocal evidence_id
+                evidence_id, _ = self._write_evidence(
+                    run_dir, task_id, run_id, outcome, contract, proposal, patch,
+                    validations, review, checkpoint.commit, changed_paths=changed_paths,
+                )
+
             try:
                 campaign_checkpoint = self.attempts.recover_or_checkpoint(
                     campaign_id=campaign_id, workspace=worktree,
                     task_id=task_id, run_id=run_id,
+                    before_record=write_acceptance_evidence,
+                )
+            except CheckpointPublicationPending as error:
+                workspace.cleanup()
+                return RunOutcome(
+                    "INFRA_FAILURE", f"checkpoint publication must be retried: {error}",
+                    task_id, run_id, evidence_id,
+                    {"failure_class": "checkpoint_publication_pending"},
                 )
             except CampaignWorkspaceError as error:
                 workspace.cleanup()
@@ -531,9 +513,11 @@ class RunController:
                     failure_class="checkpoint_conflict",
                 )
             checkpoint_id = campaign_checkpoint.commit
-        evidence_id, _ = self._write_evidence(
-            run_dir, task_id, run_id, outcome, contract, proposal, patch, validations, review, checkpoint_id
-        )
+        if evidence_id is None:
+            evidence_id, _ = self._write_evidence(
+                run_dir, task_id, run_id, outcome, contract, proposal, patch, validations, review,
+                checkpoint_id, changed_paths=changed_paths,
+            )
         if campaign_workspace is None:
             try:
                 workspace.apply(patch)
@@ -541,6 +525,7 @@ class RunController:
                 failure_id, _ = self._write_evidence(
                     run_dir, task_id, run_id, "INFRA_FAILURE", contract,
                     {"summary": str(error)}, patch, validations, review, checkpoint_id,
+                    changed_paths=changed_paths,
                 )
                 return self._finish(run_id, "INFRA_FAILURE", evidence_id=failure_id, proposal={"summary": str(error)})
         workspace.cleanup()
