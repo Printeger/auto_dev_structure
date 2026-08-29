@@ -1561,6 +1561,97 @@ class ActionProtocolTests(unittest.TestCase):
     def test_validation_failure_recovers_after_run_finish_before_operated_journal(self) -> None:
         self._assert_rework_finish_to_operated_recovery("VALIDATION_FAILURE")
 
+    def test_finished_validation_failure_does_not_rerun_changing_output(self) -> None:
+        self._assert_finished_validation_recovery_without_rerun(returncode=1)
+
+    def test_finished_validation_failure_cannot_be_bypassed_by_transient_pass(self) -> None:
+        self._assert_finished_validation_recovery_without_rerun(returncode=0)
+
+    def test_finished_validation_failure_rejects_tampered_persisted_failure(self) -> None:
+        self._assert_finished_validation_recovery_without_rerun(returncode=0, tamper=True)
+
+    def _assert_finished_validation_recovery_without_rerun(
+        self, *, returncode: int, tamper: bool = False,
+    ) -> None:
+        campaign_id = self.approve()
+        controller = ActionController(self.root)
+        action = dict(controller.get_next_action(campaign_id).action or {})
+        workspace = Path(action["workspace"])
+        workspace.joinpath("app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        result = self.passing_result(action)
+        first_validation = {
+            "index": 0, "argv": ["changing-check"], "cwd": ".", "returncode": 1,
+            "timed_out": False, "stdout": "first failure\n", "stderr": "first stderr\n",
+            "duration_seconds": 0.1,
+        }
+        retry_validation = {
+            **first_validation, "returncode": returncode, "stdout": "changed output\n",
+            "stderr": "changed stderr\n", "duration_seconds": 0.2,
+        }
+        validation_calls = 0
+
+        def changing_validation(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            nonlocal validation_calls
+            validation_calls += 1
+            return [first_validation if validation_calls == 1 else retry_validation]
+
+        from autodev import action as action_module
+        original = action_module._write_json_atomic
+        failed_once = False
+
+        def fail_operated_journal(path: Path, value: object) -> None:
+            nonlocal failed_once
+            if (
+                not failed_once
+                and path == self.root / f".autodev/actions/{action['id']}/finalization.json"
+                and isinstance(value, dict)
+                and value.get("phase") == "OPERATED"
+            ):
+                failed_once = True
+                raise OSError("injected validation operated-journal fault")
+            original(path, value)
+
+        with mock.patch(
+            "autodev.attempt_lifecycle.AttemptLifecycle.run_validations",
+            autospec=True, side_effect=changing_validation,
+        ):
+            with mock.patch.object(
+                action_module, "_write_json_atomic", side_effect=fail_operated_journal,
+            ):
+                interrupted = controller.submit_action_result(action["id"], result)
+            self.assertEqual(interrupted.status, "INFRA_FAILURE", interrupted)
+            self.assertEqual(validation_calls, 1)
+
+            conflicting = dict(result, summary="conflicting duplicate")
+            before_conflict = self.snapshot()
+            self.assertEqual(
+                ActionController(self.root).submit_action_result(
+                    action["id"], conflicting,
+                ).status,
+                "INVALID",
+            )
+            self.assertEqual(self.snapshot(), before_conflict)
+            self.assertEqual(validation_calls, 1)
+
+            if tamper:
+                failure_path = self.root / f".autodev/runs/{action['context']['run_id']}/failure.json"
+                failure = json.loads(failure_path.read_text())
+                failure["validations"][0]["stdout"] = "tampered\n"
+                failure_path.write_text(json.dumps(failure), encoding="utf-8")
+                before_retry = self.snapshot()
+                recovered = ActionController(self.root).submit_action_result(action["id"], result)
+                self.assertEqual(recovered.status, "INVALID", recovered)
+                self.assertEqual(self.snapshot(), before_retry)
+                self.assertEqual(validation_calls, 1)
+                return
+
+            recovered = ActionController(self.root).submit_action_result(action["id"], result)
+
+        self.assertEqual(recovered.status, "NOT_READY", recovered)
+        self.assertEqual(recovered.data["validations"], [first_validation])
+        self.assertEqual(validation_calls, 1)
+        self.assertFalse(workspace.exists())
+
     def _assert_rework_finish_to_operated_recovery(
         self, kind: str, *, tamper: bool = False,
     ) -> None:

@@ -217,6 +217,16 @@ class ActionController:
             return ActionOutcome("INVALID", "stale Action revision")
         task = state.get("tasks", {}).get(action.get("task_id"), {})
         if (
+            finalization is not None
+            and finalization.get("kind") == "VALIDATION_FAILURE"
+            and finalization.get("phase") == "PREPARED"
+            and state.get("current_run_id") is None
+            and task.get("status") == "READY"
+        ):
+            return self._resume_finished_validation_failure(
+                action, dict(result), finalization,
+            )
+        if (
             task.get("status") == "ACCEPTED"
             and action["type"] in {"EXECUTE_TASK", "RUN_IMMEDIATE_REVIEW"}
         ):
@@ -911,6 +921,66 @@ class ActionController:
             cleanup_workspace=route != QualityDecision.DIAGNOSTIC,
         )
 
+    def _resume_finished_validation_failure(
+        self, action: dict[str, Any], result: dict[str, Any], intent: dict[str, Any],
+    ) -> ActionOutcome:
+        run_id = str(action["context"]["run_id"])
+        try:
+            failure = json.loads(
+                (self._canonical / "runs" / run_id / "failure.json").read_text(
+                    encoding="utf-8",
+                )
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            return ActionOutcome("INFRA_FAILURE", f"validation failure cannot be recovered: {error}")
+        if not isinstance(failure, dict):
+            return ActionOutcome("INVALID", "validation failure has an invalid contract")
+        validations = failure.get("validations")
+        changed_paths = failure.get("changed_paths")
+        diff_hash = failure.get("diff_hash")
+        if (
+            failure.get("action_id") != action["id"]
+            or failure.get("task_id") != action.get("task_id")
+            or not isinstance(validations, list)
+            or not validations
+            or not all(isinstance(item, dict) for item in validations)
+            or not any(item.get("returncode") != 0 for item in validations)
+            or not isinstance(changed_paths, list)
+            or not all(isinstance(path, str) for path in changed_paths)
+            or not isinstance(diff_hash, str)
+            or not isinstance(failure.get("diagnostic_action_id"), str)
+        ):
+            return ActionOutcome("INVALID", "validation failure has an invalid contract")
+        try:
+            fingerprint = _hash({
+                "task_id": action["task_id"], "diff_hash": diff_hash,
+                "failed": [
+                    {
+                        "argv": item["argv"], "returncode": item["returncode"],
+                        "timed_out": item["timed_out"],
+                    }
+                    for item in validations if item["returncode"] != 0
+                ],
+            })
+            evidence_result = {**result, "outcome": "REWORK"}
+            operated = self._finish_rework_operation(
+                action, result, evidence_result, None, changed_paths, validations,
+                expected_diff_hash=diff_hash,
+            )
+        except (KeyError, TypeError, ValueError):
+            return ActionOutcome("INVALID", "validation failure has an invalid contract")
+        if failure.get("fingerprint") != fingerprint:
+            return ActionOutcome("INVALID", "validation failure fingerprint is invalid")
+        if operated is not None:
+            return operated
+        try:
+            intent = self._mark_finalization(action, intent, "OPERATED")
+        except OSError as error:
+            return ActionOutcome(
+                "INFRA_FAILURE", f"REWORK finalization must be retried: {error}",
+            )
+        return self._finish_validation_finalization(action, result, intent, failure)
+
     def _validation_failure_route(self, action: Mapping[str, Any]) -> QualityDecision:
         same_failures = []
         diagnostic_used = False
@@ -1314,14 +1384,17 @@ class ActionController:
 
     def _finish_rework_operation(
         self, action: Mapping[str, Any], submitted_result: Mapping[str, Any],
-        evidence_result: Mapping[str, Any], patch: bytes, changed_paths: list[str],
+        evidence_result: Mapping[str, Any], patch: bytes | None, changed_paths: list[str],
         validations: list[dict[str, Any]],
+        *, expected_diff_hash: str | None = None,
     ) -> ActionOutcome | None:
         """Durably finish a Core-derived REWORK operation before Action resolution."""
 
         run_id = str(action["context"]["run_id"])
         state = self._read_state()
         if state.get("current_run_id") == run_id:
+            if patch is None:
+                return ActionOutcome("INFRA_FAILURE", "REWORK patch cannot be recovered before run.finish")
             evidence_id = self._write_evidence(
                 action, evidence_result, patch, changed_paths, validations, None,
                 action_result=submitted_result,
@@ -1343,6 +1416,7 @@ class ActionController:
         if not isinstance(evidence, dict):
             return ActionOutcome("INVALID", "REWORK evidence has an invalid contract")
         task = state.get("tasks", {}).get(action.get("task_id"), {})
+        expected_diff_hash = expected_diff_hash or _hash(patch or b"")
         acceptance_fields = (
             "schema_version", "task_id", "outcome", "contract_gate_hash", "diff_hash",
             "changed_paths", "validations", "quality_route", "findings", "debt_items",
@@ -1384,7 +1458,7 @@ class ActionController:
             or evidence.get("run_id") != run_id
             or evidence.get("task_id") != action.get("task_id")
             or evidence.get("outcome") != "REWORK"
-            or evidence.get("diff_hash") != _hash(patch)
+            or evidence.get("diff_hash") != expected_diff_hash
             or evidence.get("changed_paths") != sorted(changed_paths)
             or evidence.get("validations") != self._attempts.validation_evidence(validations)
             or evidence.get("acceptance_hash") != _hash(acceptance)
